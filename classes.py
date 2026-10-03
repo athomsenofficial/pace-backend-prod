@@ -1,3 +1,18 @@
+
+from dataclasses import dataclass
+from typing import Literal
+
+
+@dataclass
+class EligibilityResult:
+    """Typed return from board_filter — replaces ambiguous tuple/bool/None."""
+    status: Literal["eligible", "ineligible", "btz", "discrepancy", "skip"]
+    reason: str | None = None
+
+    @property
+    def is_eligible(self) -> bool:
+        return self.status in ("eligible", "btz", "discrepancy")
+
 from typing import Dict
 from pydantic import BaseModel
 
@@ -17,3 +32,14 @@ class PasCodeInfo(BaseModel):
 class PasCodeSubmission(BaseModel):
     session_id: str
     pascode_info: Dict[str, PasCodeInfo]
+
+class PromotionEligibilityRequest(BaseModel):
+    tig_date: str  # DD-MMM-YYYY or ISO format
+    tis_date: str
+    current_rank: str
+    target_year: int
+
+class BTZEligibilityRequest(BaseModel):
+    enlistment_date: str
+    a1c_dor: str
+    target_year: int

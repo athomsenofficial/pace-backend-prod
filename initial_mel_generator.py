@@ -57,6 +57,24 @@ def generate_pascode_pdf(eligible_data, ineligible_data, discrepancy_data, btz_d
         print(f"Error generating PDF for pascode {pascode}: {e}")
         return None
 
+def _format_sig_name(first, middle, last, fallback='N/A'):
+    """Format name for signature block: FIRST M. LAST"""
+    first = (first or '').strip()
+    middle = (middle or '').strip()
+    last = (last or '').strip()
+    if first or last:
+        parts = []
+        if first:
+            parts.append(first)
+        if middle:
+            mi = middle if middle.endswith('.') else middle[0] + '.'
+            parts.append(mi)
+        if last:
+            parts.append(last)
+        return ' '.join(parts).upper()
+    return (fallback or 'N/A').upper()
+
+
 def generate_small_unit_pdf(small_unit_data, senior_rater, cycle, melYear, pas_info, base_filename, logo_path):
     """Generate PDF for small unit data."""
     try:
@@ -71,6 +89,12 @@ def generate_small_unit_pdf(small_unit_data, senior_rater, cycle, melYear, pas_i
         doc.pas_info = {
             'srid': senior_rater.get('srid', 'N/A'),
             'fd name': senior_rater.get('senior_rater_name', 'N/A'),
+            'signature_name': _format_sig_name(
+                senior_rater.get('senior_rater_first_name', ''),
+                senior_rater.get('senior_rater_middle_name', ''),
+                senior_rater.get('senior_rater_last_name', ''),
+                senior_rater.get('senior_rater_name', 'N/A')
+            ),
             'rank': senior_rater.get('senior_rater_rank', 'N/A'),
             'title': senior_rater.get('senior_rater_title', 'N/A'),
             'srid mpf': pas_info.get('srid mpf', 'N/A'),
@@ -123,6 +147,14 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             cols_to_keep = [col for col in df_cols if col in expected_cols or col in ['FULL_NAME', 'GRADE', 'DATE_ARRIVED_STATION', 'DAFSC', 'ASSIGNED_PAS_CLEARTEXT', 'DOR', 'TAFMSD', 'ASSIGNED_PAS', 'REASON']]
             if cols_to_keep:
                 df = df[cols_to_keep]
+
+            if 'FULL_NAME' in df.columns and not df.empty:
+                df = df.sort_values(
+                    by='FULL_NAME',
+                    key=lambda s: s.astype(str).str.upper(),
+                    kind='stable',
+                    na_position='last',
+                ).reset_index(drop=True)
 
             return df
 
@@ -178,6 +210,7 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             small_unit_pas_info = {
                 'fdid': f'{senior_rater.get("srid", "")}',
                 'fd name': su_commander_name if su_commander_name else 'N/A',
+                'signature_name': _format_sig_name(su_commander_first, su_commander_middle, su_commander_last, su_commander_name),
                 'srid': senior_rater.get("srid", "N/A"),
                 'srid mpf': senior_rater.get("srid", "")[:2] if senior_rater.get("srid") else 'N/A'
             }
@@ -218,6 +251,7 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
                 'rank': pascode_map[pascode].get('commander_rank') or pascode_map[pascode].get('senior_rater_rank', 'N/A'),
                 'title': pascode_map[pascode].get('commander_title') or pascode_map[pascode].get('senior_rater_title', 'N/A'),
                 'fd name': commander_name,
+                'signature_name': _format_sig_name(commander_first, commander_middle, commander_last, commander_name),
                 'fdid': f'{pascode_map[pascode].get("srid", "")}{pascode[-4:]}',
                 'srid mpf': pascode[:2],
                 'mp': must_promote,
@@ -257,6 +291,7 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             small_unit_pas_info = {
                 'fdid': f'{senior_rater.get("srid", "")}',
                 'fd name': su_commander_name if su_commander_name else 'N/A',
+                'signature_name': _format_sig_name(su_commander_first, su_commander_middle, su_commander_last, su_commander_name),
                 'srid': senior_rater.get("srid", "N/A"),
                 'srid mpf': senior_rater.get("srid", "")[:2] if senior_rater.get("srid") else 'N/A'
             }

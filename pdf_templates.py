@@ -119,11 +119,11 @@ class PDF_Template(BaseDocTemplate):
                                   "UNIT SIZE: SMALL")
 
     def _add_signature_block(self, canvas, doc, header_top):
-        """Add signature block."""
+        """Add signature block. Format: FIRST M. LAST, Rank, USAF"""
         pas_info = doc.pas_info
         canvas.setFont(BOLD_FONT, PDF_FONT_SIZE_HEADER)
         title_y = header_top - 0.5 * inch
-        officer_name = pas_info.get('fd name', 'N/A')
+        officer_name = pas_info.get('signature_name') or pas_info.get('fd name', 'N/A')
         rank = pas_info.get('rank', 'N/A')
         title = pas_info.get('title', 'N/A')
         canvas.drawString(PDF_HEADER_SIGNATURE_X, title_y, f"{officer_name}, {rank}, USAF")
@@ -173,7 +173,7 @@ class PDF_Template(BaseDocTemplate):
         identifier_text = f"{str(self.melYear + 1)[-2:]}{PROMOTION_MAP.get(self.cycle, 'XX')} - {'Initial MEL' if isinstance(doc, InitialMELDocument) else 'Final MEL'}"
         identifier_width = stringWidth(identifier_text, BOLD_FONT, PDF_FONT_SIZE_FOOTER_BOTTOM)
         identifier_center_x = (self.page_width / 2) - (identifier_width / 2)
-        canvas.drawString(identifier_center_x, PDF_FOOTER_BOTTOM_Y - 18, identifier_text)
+        canvas.drawString(identifier_center_x, PDF_FOOTER_BOTTOM_Y - 13, identifier_text)
         accounting_text = f"Accounting Date: {self._get_accounting_date()}"
         accounting_width = stringWidth(accounting_text, BOLD_FONT, PDF_FONT_SIZE_FOOTER_BOTTOM)
         canvas.drawString(self.page_width - PDF_MARGIN - accounting_width, PDF_FOOTER_BOTTOM_Y, accounting_text)

@@ -37,6 +37,17 @@ def mask_name(name: str) -> str:
     return ", ".join(masked_parts)
 
 
+def to_initials(name: str) -> str:
+    """
+    Convert a full name to initials only.
+    Example: "SMITH, JOHN MICHAEL" -> "S.J.M."
+    """
+    if not name or not isinstance(name, str):
+        return "?"
+    clean = name.replace(",", "").split()
+    return ".".join(w[0] for w in clean if w) + "."
+
+
 def mask_pii_in_message(message: str) -> str:
     """
     Scan a log message and mask any potential PII patterns.
@@ -156,13 +167,7 @@ class LoggerSetup:
         cls._session_loggers[logger_key] = logger
 
         # Log the session start info
-        logger.info("=" * 80)
-        logger.info(f"ROSTER PROCESSING LOG - {cycle} {year}")
-        logger.info(f"Session ID: {session_id}")
-        logger.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logger.info(f"Log File: {log_filename}")
-        logger.info("=" * 80)
-        logger.info("")
+        logger.info(f"ROSTER PROCESSING - {cycle} {year} | Session: {session_id[:8]}")
 
         return logger
 
@@ -180,11 +185,7 @@ class LoggerSetup:
             logger = cls._session_loggers[logger_key]
 
             # Log session end
-            logger.info("")
-            logger.info("=" * 80)
             logger.info(f"SESSION COMPLETED")
-            logger.info(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info("=" * 80)
 
             # Close all handlers
             for handler in logger.handlers[:]:
@@ -197,28 +198,18 @@ class LoggerSetup:
 
 def log_session_start(logger, session_id: str, event_type: str):
     """Log the start of a session processing event"""
-    logger.info("=" * 80)
-    logger.info(f"SESSION START: {event_type}")
-    logger.info(f"Session ID: {session_id}")
-    logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 80)
+    logger.info(f"SESSION START: {event_type} | {session_id[:8]}")
 
 
 def log_session_end(logger, session_id: str, event_type: str, status: str = "SUCCESS"):
     """Log the end of a session processing event"""
-    logger.info("-" * 80)
-    logger.info(f"SESSION END: {event_type}")
-    logger.info(f"Session ID: {session_id}")
-    logger.info(f"Status: {status}")
-    logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 80)
-    logger.info("")  # Add blank line for readability
+    logger.info(f"SESSION END: {event_type} | {status}")
 
 
 def log_member_processing(logger, member_name: str, step: str, details: str = None):
     """Log individual member processing steps with PII masking"""
-    masked_name = mask_name(member_name)
-    msg = f"Member: {masked_name} | Step: {step}"
+    initials = to_initials(member_name)
+    msg = f"{initials} | {step}"
     if details:
         msg += f" | {details}"
     logger.info(msg)
@@ -227,15 +218,15 @@ def log_member_processing(logger, member_name: str, step: str, details: str = No
 def log_board_filter_decision(logger, member_name: str, eligible: bool,
                                reason: str = None, is_btz: bool = False):
     """Log board filter eligibility decision with PII masking"""
-    masked_name = mask_name(member_name)
+    initials = to_initials(member_name)
 
-    status = "ELIGIBLE" if eligible else "INELIGIBLE"
+    status = "PASS" if eligible else "FAIL"
     if is_btz:
-        status = "ELIGIBLE (BTZ)"
+        status = "PASS (BTZ)"
 
-    msg = f"DECISION: {masked_name} | {status}"
+    msg = f"{initials} | {status}"
     if reason:
-        msg += f" | Reason: {reason}"
+        msg += f" | {reason}"
 
     if eligible:
         logger.info(msg)

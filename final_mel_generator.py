@@ -152,6 +152,24 @@ def add_interactive_checkboxes(pdf_path, eligible_data, pascode):
             pass
         return pdf_path
 
+def _format_sig_name(first, middle, last, fallback='N/A'):
+    """Format name for signature block: FIRST M. LAST"""
+    first = (first or '').strip()
+    middle = (middle or '').strip()
+    last = (last or '').strip()
+    if first or last:
+        parts = []
+        if first:
+            parts.append(first)
+        if middle:
+            mi = middle if middle.endswith('.') else middle[0] + '.'
+            parts.append(mi)
+        if last:
+            parts.append(last)
+        return ' '.join(parts).upper()
+    return (fallback or 'N/A').upper()
+
+
 def generate_final_mel_pdf(eligible_data, ineligible_data, discrepancy_data, senior_rater, senior_raters, cycle, melYear, pascode, pas_info, output_filename, logo_path):
     """Generate a PDF for a single pascode for final MEL with interactive form fields."""
     name_idx = 0; grade_idx = 1; dafsc_idx = 3; unit_idx = 4; pascode_idx = 7
@@ -267,6 +285,7 @@ def generate_small_unit_final_mel_pdf(small_unit_data, senior_rater, cycle, melY
         doc.pas_info = {
             'srid': senior_rater['srid'],
             'fd name': commander_name if commander_name else 'N/A',
+            'signature_name': _format_sig_name(commander_first, commander_middle, commander_last, commander_name),
             'fdid': f'{senior_rater["srid"]}',
             'rank': senior_rater['senior_rater_rank'],
             'title': senior_rater['senior_rater_title'],
@@ -325,6 +344,14 @@ def generate_final_roster_pdf(session_id, output_filename="final_military_roster
         if cols_to_keep:
             df = df[cols_to_keep]
 
+        if 'FULL_NAME' in df.columns and not df.empty:
+            df = df.sort_values(
+                by='FULL_NAME',
+                key=lambda s: s.astype(str).str.upper(),
+                kind='stable',
+                na_position='last',
+            ).reset_index(drop=True)
+
         return df
 
     eligible_df = clean_dataframe(session.get('eligible_df', []))
@@ -380,6 +407,7 @@ def generate_final_roster_pdf(session_id, output_filename="final_military_roster
         # For large units, use commander info for signature block
         pas_info = {
             'srid': pascode_map[pascode]['srid'], 'fd name': commander_name,
+                'signature_name': _format_sig_name(commander_first, commander_middle, commander_last, commander_name),
             'rank': pascode_map[pascode].get('commander_rank') or pascode_map[pascode].get('senior_rater_rank', 'N/A'),
             'title': pascode_map[pascode].get('commander_title') or pascode_map[pascode].get('senior_rater_title', 'N/A'),
             'fdid': f'{pascode_map[pascode]["srid"]}{pascode[-4:]}', 'srid mpf': pascode[:2],

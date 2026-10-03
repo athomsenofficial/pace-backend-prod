@@ -12,7 +12,8 @@ from constants import (
 
 from datetime import datetime
 from date_parsing import parse_date
-from logging_config import LoggerSetup, mask_name
+from logging_config import LoggerSetup, to_initials
+from classes import EligibilityResult
 
 def format_date_for_display(date_value):
     """Format date for display in PDFs as DD-MMM-YYYY"""
@@ -30,10 +31,10 @@ def format_date_for_display(date_value):
 
     return str(date_value)
 
-def roster_processor(roster_df, session_id, cycle, year):
+def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
     # Create session-specific logger
     logger = LoggerSetup.get_session_logger(session_id, cycle, year)
-    logger.info(f"Processing roster with {len(roster_df)} total members")
+    logger.info(f"Processing {len(roster_df)} members")
 
     eligible_service_members = []
     eligible_btz_service_members = []
@@ -57,13 +58,12 @@ def roster_processor(roster_df, session_id, cycle, year):
         error_msg = f"Missing required columns: {', '.join(missing_columns)}"
         error_log.append(error_msg)
         logger.error(error_msg)
-        logger.info(f"STATUS: FAILED - {error_msg}")
+        logger.info(f"STATUS: FAILED")
         update_session(session_id, error_log=error_log)
         LoggerSetup.close_session_logger(session_id)
         return
 
     filtered_roster_df = roster_df[all_roster_columns].copy()
-    logger.info(f"Roster filtered to required columns. Processing {len(filtered_roster_df)} members.")
 
     # Parse all date columns in the DataFrame ONCE, before processing
     date_columns = ['DOR', 'UIF_DISPOSITION_DATE', 'TAFMSD', 'DATE_ARRIVED_STATION']
@@ -72,11 +72,6 @@ def roster_processor(roster_df, session_id, cycle, year):
             filtered_roster_df[col] = filtered_roster_df[col].apply(
                 lambda x: parse_date(x, error_log, None)
             )
-
-    # Processing loop - now working with properly parsed datetime objects
-    logger.info("=" * 80)
-    logger.info("STARTING MEMBER-BY-MEMBER PROCESSING")
-    logger.info("=" * 80)
 
     for index, row in filtered_roster_df.iterrows():
         member_name = row.get('FULL_NAME', 'Unknown')
@@ -94,61 +89,45 @@ def roster_processor(roster_df, session_id, cycle, year):
             error_log.append(msg)
             continue
 
-        # Check projected grades FIRST - this determines if they should be on the roster
-        # CRITICAL FIX: Use .get() for optional columns to prevent KeyError
+        # Check projected grades FIRST
         projected_grade = row.get('GRADE_PERM_PROJ')
 
-        # If projected for next grade (e.g., MSG when cycle is TSG), exclude completely - skip silently
+        # If projected for next grade, exclude completely
         if projected_grade == PROMOTIONAL_MAP.get(cycle):
             continue
 
         # Check if member should be included in this cycle's roster
-        # Include if: (1) current grade matches cycle OR (2) projected for this cycle
         has_projected_grade = projected_grade == cycle
         grade_matches_cycle = row['GRADE'] == cycle or (row['GRADE'] == 'A1C' and cycle == 'SRA')
 
-        # Skip if wrong cycle - skip silently
+        # Skip if wrong cycle
         if not (grade_matches_cycle or has_projected_grade):
             continue
 
-        # Check accounting date - those who fail should be excluded completely - skip silently
+        # Check accounting date
         valid_member = accounting_date_check(row['DATE_ARRIVED_STATION'], cycle, year, logger=None)
         if not valid_member:
             continue
-
-        # ONLY log members that will appear on the roster (passed all initial filters)
-        # Use PII masking for CUI compliance
-        logger.info(f"\n{'='*60}")
-        logger.info(f"ROW {index}: Processing {mask_name(member_name)}")
-        logger.info(f"  Current Grade: {grade}")
-        logger.info(f"  Promotion Cycle: {cycle} {year}")
-        logger.info(f"  Projected Grade: {projected_grade if projected_grade else 'None'}")
-        logger.info(f"  ✓ Grade matches cycle or projected for cycle")
-        logger.info(f"  ✓ Accounting date check passed")
 
         # Check for missing required data
         missing_required = False
         for column in REQUIRED_COLUMNS:
             if column in row and pd.isna(row[column]):
                 error_log.append(f"Missing required data at row {index}, column {column}")
-                logger.warning(f"  ❌ Missing required column: {column}")
                 missing_required = True
                 break
 
         if missing_required:
             ineligible_service_members.append(index)
             reason_for_ineligible_map[index] = 'Missing required data'
-            logger.info(f"  Decision: Marked as ineligible (Missing Required Data)")
+            logger.warning(f"{to_initials(member_name)} | FAIL | Missing required data")
             continue
-
-        logger.info(f"  ✓ All required data present")
 
         # If already projected for this cycle, mark as ineligible
         if has_projected_grade:
             ineligible_service_members.append(index)
             reason_for_ineligible_map[index] = f'Projected for {cycle}.'
-            logger.info(f"  ❌ INELIGIBLE: Already projected for {cycle}")
-            logger.info(f"  Decision: Marked as ineligible (Already Projected)")
+            logger.warning(f"{to_initials(member_name)} | FAIL | Already projected for {cycle}")
             continue
 
         # Track PASCODEs
@@ -156,63 +135,36 @@ def roster_processor(roster_df, session_id, cycle, year):
             pascodes.append(row['ASSIGNED_PAS'])
             pascodeUnitMap[row['ASSIGNED_PAS']] = row['ASSIGNED_PAS_CLEARTEXT']
 
-        logger.info(f"  ✓ Ready for board filter - calling board_filter() for detailed eligibility check")
-
-        # Board filter check - pass member info and logger for logging
+        # Board filter check - logs its own PASS/FAIL line per member
         member_status = board_filter(row['GRADE'], year, row['DOR'], row['UIF_CODE'],
                                      row['UIF_DISPOSITION_DATE'], row['TAFMSD'], row['REENL_ELIG_STATUS'],
                                      row['PAFSC'], row['2AFSC'], row['3AFSC'], row['4AFSC'],
-                                     member_name=member_name, logger=logger)
+                                     member_name=member_name, roster_type=roster_type, logger=logger)
 
-        if member_status is None:
-            logger.info(f"  Decision: Not eligible (returned None from board_filter)")
+        if member_status.status == "skip":
             continue
 
-        # Handle tuple or list cases
-        elif isinstance(member_status, (tuple, list)):
-            # Validate tuple has at least one element before accessing
-            if len(member_status) == 0:
-                logger.warning(f"  ⚠️ WARNING: Empty tuple returned from board_filter")
-                continue
+        elif member_status.status == "discrepancy":
+            eligible_service_members.append(index)
+            discrepancy_service_members.append(index)
+            unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
+            if member_status.reason:
+                reason_for_ineligible_map[index] = member_status.reason
 
-            # Case: discrepancy (tuple of strings)
-            if isinstance(member_status[0], str) and member_status[0] == 'discrepancy':
-                eligible_service_members.append(index)
-                discrepancy_service_members.append(index)
-                # Update unit_total_map for discrepancy members (they're still eligible)
-                unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
-                if len(member_status) > 1:
-                    reason_for_ineligible_map[index] = member_status[1]
-                logger.info(f"  ✅ ELIGIBLE (WITH DISCREPANCY): {member_status[1] if len(member_status) > 1 else 'No reason provided'}")
-                logger.info(f"  Decision: Added to eligible roster with discrepancy flag")
+        elif member_status.status == "btz":
+            eligible_btz_service_members.append(index)
+            unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
 
-            # Case: BTZ eligible (True, 'btz')
-            elif member_status[0] is True and len(member_status) > 1 and member_status[1] == 'btz':
-                eligible_btz_service_members.append(index)
-                # Update unit_total_map for BTZ members
-                unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
-                logger.info(f"  ✅ ELIGIBLE (BTZ): Below-the-Zone eligibility")
-                logger.info(f"  Decision: Added to BTZ eligible roster")
+        elif member_status.status == "ineligible":
+            ineligible_service_members.append(index)
+            if member_status.reason:
+                reason_for_ineligible_map[index] = member_status.reason
 
-            # Case: ineligible (False, reason)
-            elif member_status[0] is False:
-                ineligible_service_members.append(index)
-                if len(member_status) > 1:
-                    reason_for_ineligible_map[index] = member_status[1]
-                    logger.info(f"  ❌ INELIGIBLE: {member_status[1]}")
-                else:
-                    logger.info(f"  ❌ INELIGIBLE: No specific reason provided")
-                logger.info(f"  Decision: Added to ineligible roster")
-
-        # Handle plain True (no tuple)
-        elif member_status is True:
+        elif member_status.status == "eligible":
             eligible_service_members.append(index)
             unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
-            logger.info(f"  ✅ ELIGIBLE: Meets all requirements")
-            logger.info(f"  Decision: Added to eligible roster")
 
     pascodes = sorted(pascodes)
-    update_session(session_id, pascodes=pascodes)
 
     # Create PDF DataFrames with parsed datetime objects
     pdf_roster = filtered_roster_df[PDF_COLUMNS].copy()
@@ -264,44 +216,33 @@ def roster_processor(roster_df, session_id, cycle, year):
     else:
         small_unit_df = pd.DataFrame()
 
-    # Update session with results
-    update_session(session_id, eligible_df=eligible_df)
-    update_session(session_id, ineligible_df=ineligible_df)
-    update_session(session_id, discrepancy_df=discrepancy_df)
-    update_session(session_id, btz_df=btz_df)
-    update_session(session_id, small_unit_df=small_unit_df)
-
+    # Update session with all results in a single batch call
+    session_updates = dict(
+        pascodes=pascodes,
+        eligible_df=eligible_df,
+        ineligible_df=ineligible_df,
+        discrepancy_df=discrepancy_df,
+        btz_df=btz_df,
+        small_unit_df=small_unit_df,
+    )
     if pascodeUnitMap:
-        update_session(session_id, pascode_unit_map=pascodeUnitMap)
-
+        session_updates["pascode_unit_map"] = pascodeUnitMap
     if error_log:
-        update_session(session_id, error_log=error_log)
+        session_updates["error_log"] = error_log
+
+    update_session(session_id, **session_updates)
 
     # Calculate members on roster
     total_on_roster = (len(eligible_service_members) + len(eligible_btz_service_members) +
                       len(ineligible_service_members))
     total_skipped = len(filtered_roster_df) - total_on_roster
 
-    # Log summary statistics
-    logger.info("")
-    logger.info("=" * 80)
-    logger.info("PROCESSING SUMMARY")
-    logger.info("=" * 80)
-    logger.info(f"Total Members in Upload: {len(filtered_roster_df)}")
-    logger.info(f"Members on Roster (logged above): {total_on_roster}")
-    logger.info(f"Members Skipped (not matching cycle/accounting date): {total_skipped}")
-    logger.info("")
-    logger.info("ROSTER BREAKDOWN:")
-    logger.info(f"  • Eligible Members: {len(eligible_service_members)}")
-    logger.info(f"  • BTZ Eligible Members: {len(eligible_btz_service_members)}")
-    logger.info(f"  • Ineligible Members: {len(ineligible_service_members)}")
-    logger.info(f"  • Discrepancy Members: {len(discrepancy_service_members)}")
-    logger.info("")
-    logger.info(f"PASCODEs (Units) Found: {len(pascodes)}")
-    logger.info(f"Small Units Requiring Senior Rater: {len(small_unit_pascodes)}")
+    # Log summary
+    logger.info(f"SUMMARY | Total: {len(filtered_roster_df)} | Processed: {total_on_roster} | Skipped: {total_skipped}")
+    logger.info(f"RESULTS | Eligible: {len(eligible_service_members)} | BTZ: {len(eligible_btz_service_members)} | Ineligible: {len(ineligible_service_members)} | Discrepancy: {len(discrepancy_service_members)}")
+    logger.info(f"UNITS | PASCODEs: {len(pascodes)} | Small units: {len(small_unit_pascodes)}")
     if error_log:
-        logger.warning(f"Errors Encountered: {len(error_log)}")
-
+        logger.warning(f"ERRORS | {len(error_log)} errors encountered")
     logger.info(f"STATUS: SUCCESS")
 
     # Close the session logger
@@ -356,3 +297,36 @@ def recalculate_small_units(session_id):
 
     # Update session with the recalculated small_unit_df
     update_session(session_id, small_unit_df=small_unit_df)
+
+def rescan_and_update_pascodes(session_id: str):
+    """
+    Re-scan ALL categories for PASCODEs and update session.
+    This ensures PASCODE tracking stays synchronized with roster data
+    after add/edit/delete operations.
+    """
+    session = get_session(session_id)
+    if not session:
+        return
+
+    all_pascodes = set()
+    pascode_unit_map = {}
+
+    for cat_key in ['eligible_df', 'ineligible_df', 'discrepancy_df', 'btz_df', 'small_unit_df']:
+        cat_list = session.get(cat_key, [])
+        if isinstance(cat_list, list):
+            for member in cat_list:
+                if not member.get('deleted', False):
+                    pas = member.get('ASSIGNED_PAS')
+                    if pas and isinstance(pas, str) and pas.strip():
+                        all_pascodes.add(pas.strip())
+                        if 'ASSIGNED_PAS_CLEARTEXT' in member:
+                            pascode_unit_map[pas.strip()] = member['ASSIGNED_PAS_CLEARTEXT']
+
+    if all_pascodes:
+        update_session(session_id,
+                       pascodes=sorted(list(all_pascodes)),
+                       pascode_unit_map=pascode_unit_map)
+    else:
+        update_session(session_id,
+                       pascodes=[],
+                       pascode_unit_map={})
