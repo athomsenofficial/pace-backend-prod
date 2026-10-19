@@ -44,10 +44,7 @@ backups/*
 .env
 .env.*
 
-# Test files
-test_*.py
-tests/
-*_test.py
+# Test files are included for in-container testing
 
 # OS files
 .DS_Store

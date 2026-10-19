@@ -1,0 +1,52 @@
+services:
+  # Redis service for session management (TEST)
+  redis:
+    image: redis:7.4-alpine
+    container_name: pace-redis-test
+    restart: unless-stopped
+    volumes:
+      - redis_data_test:/data
+    command: redis-server --save 60 1 --loglevel warning --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - pace-network-test
+
+  # FastAPI backend application (TEST)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pace-backend-test
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8001:8000"
+    environment:
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379
+      - SESSION_ENCRYPTION_KEY=${SESSION_ENCRYPTION_KEY}
+    volumes:
+      - ./logs:/app/logs
+      - ./tmp:/app/tmp
+      - ./backups:/app/backups
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - pace-network-test
+
+volumes:
+  redis_data_test:
+    driver: local
+
+networks:
+  pace-network-test:
+    driver: bridge

@@ -1,0 +1,23 @@
+"""
+Column definitions for roster data and PDF output.
+
+Changes when: a new data field is added to the roster format.
+"""
+
+REQUIRED_COLUMNS = [
+    'FULL_NAME', 'GRADE', 'ASSIGNED_PAS_CLEARTEXT', 'DAFSC', 'DOR',
+    'DATE_ARRIVED_STATION', 'TAFMSD', 'REENL_ELIG_STATUS', 'ASSIGNED_PAS', 'PAFSC',
+]
+
+OPTIONAL_COLUMNS = [
+    'GRADE_PERM_PROJ', 'UIF_CODE', 'UIF_DISPOSITION_DATE', '2AFSC', '3AFSC', '4AFSC',
+]
+
+PDF_COLUMNS = [
+    'FULL_NAME', 'GRADE', 'DATE_ARRIVED_STATION', 'DAFSC',
+    'ASSIGNED_PAS_CLEARTEXT', 'DOR', 'TAFMSD', 'ASSIGNED_PAS',
+]
+
+MPF_LIST_COLUMNS = [
+    'FULL_NAME', 'GRADE', 'ASSIGNED_PAS_CLEARTEXT', 'DAFSC', 'DOR', 'TAFMSD',
+]
