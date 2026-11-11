@@ -1,18 +1,21 @@
+import asyncio
 import io
 from fastapi import APIRouter, Body, Query, UploadFile, File
 from error_handling import error_response
 from fastapi.responses import JSONResponse, StreamingResponse
 import pandas as pd
-from typing import Dict
+from typing import Dict, Optional
 from session_manager import get_session, update_session
-from roster_processor import recalculate_small_units, rescan_and_update_pascodes
+from roster_processor import roster_processor, recalculate_small_units, rescan_and_update_pascodes, recheck_member_eligibility
 from constants import PDF_COLUMNS
 
 router = APIRouter(tags=["Roster"])
 
+VALID_CATEGORIES = {'eligible', 'ineligible', 'discrepancy', 'btz', 'small_unit'}
+
 
 @router.get("/roster/preview/{session_id}")
-async def get_roster_preview(
+def get_roster_preview(
     session_id: str,
     category: str = "all",
     page: int = 1,
@@ -23,6 +26,11 @@ async def get_roster_preview(
     Returns all member data from the session including eligible,
     ineligible, discrepancy, BTZ, and small unit members.
     """
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 50
+
     try:
         session = get_session(session_id)
 
@@ -50,12 +58,24 @@ async def get_roster_preview(
                 clean_record = {k: v for k, v in record.items()
                                if k not in ['deleted', 'deletion_reason']}
 
+                # member_id MUST encode the ORIGINAL stored index so edit/delete
+                # resolve to the correct row even after we sort for display below
+                # (and even when soft-deleted rows are skipped above).
                 if category:
-                    clean_record['member_id'] = f'row_{category}_{len(cleaned_records)}'
+                    clean_record['member_id'] = f'row_{category}_{idx}'
                 else:
-                    clean_record['member_id'] = f'row_{len(cleaned_records)}'
+                    clean_record['member_id'] = f'row_{idx}'
+
+                # Surface the ineligible/discrepancy reason under a lowercase
+                # `reason` key the frontend reads (the stored column is `REASON`).
+                reason_val = record.get('REASON') or record.get('reason')
+                clean_record['reason'] = reason_val if reason_val else None
 
                 cleaned_records.append(clean_record)
+
+            # Alphabetical by name (FULL_NAME is "LAST, FIRST") so the website
+            # matches the generated PDF order and added members slot into place.
+            cleaned_records.sort(key=lambda r: str(r.get('FULL_NAME', '') or '').upper())
 
             return cleaned_records
 
@@ -66,18 +86,26 @@ async def get_roster_preview(
         small_unit_df = session.get('small_unit_df', [])
         dataframe = session.get('dataframe', [])
 
+        # Cache df_to_list results to avoid redundant processing
+        total_uploaded_list = df_to_list(dataframe)
+        eligible_list = df_to_list(eligible_df, 'eligible')
+        ineligible_list = df_to_list(ineligible_df, 'ineligible')
+        discrepancy_list = df_to_list(discrepancy_df, 'discrepancy')
+        btz_list = df_to_list(btz_df, 'btz')
+        small_unit_list = df_to_list(small_unit_df, 'small_unit')
+
         statistics = {
-            "total_uploaded": len(df_to_list(dataframe)),
+            "total_uploaded": len(total_uploaded_list),
             "total_processed": (
-                len(df_to_list(eligible_df, 'eligible')) +
-                len(df_to_list(ineligible_df, 'ineligible')) +
-                len(df_to_list(discrepancy_df, 'discrepancy')) +
-                len(df_to_list(btz_df, 'btz'))
+                len(eligible_list) +
+                len(ineligible_list) +
+                len(discrepancy_list) +
+                len(btz_list)
             ),
-            "eligible": len(df_to_list(eligible_df, 'eligible')),
-            "ineligible": len(df_to_list(ineligible_df, 'ineligible')),
-            "discrepancy": len(df_to_list(discrepancy_df, 'discrepancy')),
-            "btz": len(df_to_list(btz_df, 'btz')),
+            "eligible": len(eligible_list),
+            "ineligible": len(ineligible_list),
+            "discrepancy": len(discrepancy_list),
+            "btz": len(btz_list),
             "errors": len(session.get('error_log', []))
         }
 
@@ -86,19 +114,49 @@ async def get_roster_preview(
         srid_pascode_map = session.get('srid_pascode_map', {})
         senior_rater_needed = bool(session.get('small_unit_df'))
 
+        # Apply pagination
+        all_categories = {
+            "eligible": eligible_list,
+            "ineligible": ineligible_list,
+            "discrepancy": discrepancy_list,
+            "btz": btz_list,
+            "small_unit": small_unit_list
+        }
+
+        if category != "all" and category in all_categories:
+            target_list = all_categories[category]
+            total_records = len(target_list)
+            total_pages = max(1, (total_records + page_size - 1) // page_size)
+            start = (page - 1) * page_size
+            end = start + page_size
+            paginated = {category: target_list[start:end]}
+            for k in all_categories:
+                if k != category:
+                    paginated[k] = []
+        else:
+            # Apply per-category pagination even for "all"
+            paginated = {}
+            total_records = 0
+            for k, v in all_categories.items():
+                start = (page - 1) * page_size
+                end = start + page_size
+                paginated[k] = v[start:end]
+                total_records += len(v)
+            total_pages = max(1, (max(len(v) for v in all_categories.values()) + page_size - 1) // page_size) if all_categories else 1
+
         response = {
             "session_id": session_id,
             "cycle": session.get('cycle', 'SSG'),
             "year": session.get('year', 2025),
             "edited": session.get('edited', False),
             "statistics": statistics,
-            "categories": {
-                "eligible": df_to_list(eligible_df, 'eligible'),
-                "ineligible": df_to_list(ineligible_df, 'ineligible'),
-                "discrepancy": df_to_list(discrepancy_df, 'discrepancy'),
-                "btz": df_to_list(btz_df, 'btz'),
-                "small_unit": df_to_list(small_unit_df, 'small_unit')
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "total_records": total_records,
+                "total_pages": total_pages,
             },
+            "categories": paginated,
             "errors": session.get('error_log', []),
             "pascodes": session.get('pascodes', []),
             "pascode_unit_map": session.get('pascode_unit_map', {}),
@@ -115,12 +173,15 @@ async def get_roster_preview(
         return JSONResponse(content=response)
 
     except Exception as e:
-        return error_response(500, f"Failed to retrieve roster preview: {str(e)}", context={"session_id": session_id}, exception=e)
+        return error_response(500, "Failed to retrieve roster preview", context={"session_id": session_id}, exception=e)
 
 
 @router.put("/roster/member/{session_id}/{member_id}")
 async def edit_roster_member(session_id: str, member_id: str, member_data: Dict):
     """Edit an existing member in the roster."""
+    return await asyncio.to_thread(_edit_roster_member_sync, session_id, member_id, member_data)
+
+def _edit_roster_member_sync(session_id: str, member_id: str, member_data: Dict):
     try:
         session = get_session(session_id)
 
@@ -137,6 +198,9 @@ async def edit_roster_member(session_id: str, member_id: str, member_data: Dict)
                 return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
         except (ValueError, IndexError):
             return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
+
+        if category_name not in VALID_CATEGORIES:
+            return error_response(400, f"Invalid category: {category_name}", context={"session_id": session_id})
 
         data_list = session.get(category_key, [])
 
@@ -172,6 +236,9 @@ async def edit_roster_member(session_id: str, member_id: str, member_data: Dict)
         }
         update_session(session_id, **updates)
 
+        # Re-check eligibility — member may need to move categories
+        new_category = recheck_member_eligibility(session_id, data_list[index], category_name, index)
+
         rescan_and_update_pascodes(session_id)
         recalculate_small_units(session_id)
 
@@ -179,10 +246,12 @@ async def edit_roster_member(session_id: str, member_id: str, member_data: Dict)
             "success": True,
             "message": "Member updated successfully",
             "member_id": member_id,
+            "category_changed": new_category != category_name,
+            "new_category": new_category,
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to update member: {str(e)}", context={"session_id": session_id, "member_id": member_id}, exception=e)
+        return error_response(500, "Failed to update member", context={"session_id": session_id, "member_id": member_id}, exception=e)
 
 
 @router.delete("/roster/member/{session_id}/{member_id}")
@@ -193,6 +262,9 @@ async def delete_roster_member(
     hard_delete: bool = Query(False, description="Permanently delete if True")
 ):
     """Delete a member from the roster."""
+    return await asyncio.to_thread(_delete_roster_member_sync, session_id, member_id, reason, hard_delete)
+
+def _delete_roster_member_sync(session_id, member_id, reason, hard_delete):
     try:
         session = get_session(session_id)
 
@@ -212,6 +284,9 @@ async def delete_roster_member(
                 return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
         except (ValueError, IndexError):
             return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
+
+        if category_name not in VALID_CATEGORIES:
+            return error_response(400, f"Invalid category: {category_name}", context={"session_id": session_id})
 
         data_list = session.get(category_key, [])
 
@@ -262,12 +337,15 @@ async def delete_roster_member(
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to delete member: {str(e)}", context={"session_id": session_id, "member_id": member_id}, exception=e)
+        return error_response(500, "Failed to delete member", context={"session_id": session_id, "member_id": member_id}, exception=e)
 
 
 @router.post("/roster/member/{session_id}")
 async def add_roster_member(session_id: str, data: Dict):
     """Add a new member to the roster."""
+    return await asyncio.to_thread(_add_roster_member_sync, session_id, data)
+
+def _add_roster_member_sync(session_id, data):
     try:
         session = get_session(session_id)
 
@@ -279,6 +357,9 @@ async def add_roster_member(session_id: str, data: Dict):
         reason = data.get('reason', '')
         run_eligibility_check = data.get('run_eligibility_check', True)
         senior_rater_info = data.get('senior_rater_info', {})
+
+        if category not in VALID_CATEGORIES:
+            return error_response(400, f"Invalid category: {category}", context={"session_id": session_id})
 
         if not reason:
             return error_response(400, "Reason for adding member is required", context={"session_id": session_id, "category": category})
@@ -313,6 +394,22 @@ async def add_roster_member(session_id: str, data: Dict):
             if category in ['ineligible', 'discrepancy'] and 'REASON' not in new_member:
                 new_member['REASON'] = reason
 
+        # Ensure ALL eligibility-relevant fields from the submitted data are present
+        # on the new member, even when the category template only carries display
+        # (PDF) columns. Without this, board_filter receives None for PAFSC / UIF /
+        # REENL / AFSC and misclassifies the member — the "always placed in eligible"
+        # bug. With the full data present, recheck_member_eligibility (below) runs the
+        # same board_filter the initial upload uses and routes them to the right bucket.
+        ELIGIBILITY_FIELDS = [
+            'FULL_NAME', 'GRADE', 'DOR', 'TAFMSD', 'DATE_ARRIVED_STATION',
+            'UIF_CODE', 'UIF_DISPOSITION_DATE', 'REENL_ELIG_STATUS', 'PAFSC',
+            '2AFSC', '3AFSC', '4AFSC', 'ASSIGNED_PAS', 'ASSIGNED_PAS_CLEARTEXT',
+            'DAFSC', 'GRADE_PERM_PROJ',
+        ]
+        for fld in ELIGIBILITY_FIELDS:
+            if fld in member_data:
+                new_member[fld] = member_data[fld]
+
         if category == 'eligible':
             if not reason.lower().startswith('manual add'):
                 reason = f"Manual add: {reason}"
@@ -320,22 +417,23 @@ async def add_roster_member(session_id: str, data: Dict):
         new_index = len(category_list)
         new_member['member_id'] = f"row_{category}_{new_index}"
 
+        # Accumulate all updates into a single dict for one update_session call
+        batched_updates = {
+            'edited': True
+        }
+
         if 'ASSIGNED_PAS' in new_member:
             new_pascode = new_member['ASSIGNED_PAS']
             existing_pascodes = session.get('pascodes', [])
 
-            pascode_updates = {}
             if new_pascode and new_pascode not in existing_pascodes:
                 existing_pascodes.append(new_pascode)
-                pascode_updates["pascodes"] = existing_pascodes
+                batched_updates["pascodes"] = existing_pascodes
 
             if 'ASSIGNED_PAS_CLEARTEXT' in new_member:
                 pascode_unit_map = session.get('pascode_unit_map', {})
                 pascode_unit_map[new_pascode] = new_member['ASSIGNED_PAS_CLEARTEXT']
-                pascode_updates["pascode_unit_map"] = pascode_unit_map
-
-            if pascode_updates:
-                update_session(session_id, **pascode_updates)
+                batched_updates["pascode_unit_map"] = pascode_unit_map
 
             if senior_rater_info and new_pascode:
                 pascode_map = session.get('pascode_map', {})
@@ -347,7 +445,7 @@ async def add_roster_member(session_id: str, data: Dict):
                     'pascode': new_pascode,
                     'unit_name': new_member.get('ASSIGNED_PAS_CLEARTEXT', '')
                 }
-                update_session(session_id, pascode_map=pascode_map)
+                batched_updates["pascode_map"] = pascode_map
 
         if senior_rater_info and senior_rater_info.get('SRID'):
             small_unit_sr = session.get('small_unit_sr', {})
@@ -358,22 +456,27 @@ async def add_roster_member(session_id: str, data: Dict):
                     'senior_rater_rank': senior_rater_info.get('SENIOR_RATER_RANK', ''),
                     'senior_rater_title': senior_rater_info.get('SENIOR_RATER_TITLE', '')
                 }
-                update_session(session_id, small_unit_sr=small_unit_sr)
+                batched_updates["small_unit_sr"] = small_unit_sr
 
         category_list.append(new_member)
+        batched_updates[category_key] = pd.DataFrame(category_list)
 
         pdf_list = session.get('pdf_dataframe', [])
         if isinstance(pdf_list, list):
             pdf_new_member = new_member.copy()
             pdf_new_member.pop('member_id', None)
             pdf_list.append(pdf_new_member)
-            update_session(session_id, pdf_dataframe=pd.DataFrame(pdf_list))
+            batched_updates["pdf_dataframe"] = pd.DataFrame(pdf_list)
 
-        update_dict = {
-            category_key: pd.DataFrame(category_list),
-            'edited': True
-        }
-        update_session(session_id, **update_dict)
+        update_session(session_id, **batched_updates)
+
+        # Re-check eligibility — member may belong in a different category
+        if run_eligibility_check:
+            new_category = recheck_member_eligibility(
+                session_id, new_member, category, len(category_list) - 1
+            )
+        else:
+            new_category = category
 
         rescan_and_update_pascodes(session_id)
         recalculate_small_units(session_id)
@@ -381,12 +484,13 @@ async def add_roster_member(session_id: str, data: Dict):
         return JSONResponse(content={
             "success": True,
             "message": "Member added successfully",
-            "member_id": member_data.get('member_id'),
-            "category": category,
+            "member_id": new_member.get('member_id'),
+            "category": new_category,
+            "category_changed": new_category != category,
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to add member: {str(e)}", context={"session_id": session_id, "category": category}, exception=e)
+        return error_response(500, "Failed to add member", context={"session_id": session_id, "category": category}, exception=e)
 
 
 @router.post("/roster/logo/{session_id}")
@@ -404,13 +508,24 @@ async def upload_logo(session_id: str, logo: UploadFile = File(...)):
 
         logo_data = await logo.read()
 
+        # Enforce 2MB logo size limit
+        if len(logo_data) > 2 * 1024 * 1024:
+            return error_response(400, "Logo file too large. Maximum size is 2MB.", context={"session_id": session_id})
+
+        # Store logo in a separate Redis key to avoid bloating the session
+        import base64
+        from session_manager import _get_redis, _encrypt_data
+        from constants import session_ttl
+        logo_key = f"{session_id}_logo"
+        encrypted_logo = _encrypt_data(base64.b64encode(logo_data).decode())
+        _get_redis().set(logo_key, encrypted_logo, ex=session_ttl)
+
         update_session(
             session_id,
             custom_logo={
                 "uploaded": True,
                 "filename": logo.filename,
                 "content_type": logo.content_type,
-                "data": logo_data.hex()
             },
             edited=True
         )
@@ -422,11 +537,11 @@ async def upload_logo(session_id: str, logo: UploadFile = File(...)):
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to upload logo: {str(e)}", context={"session_id": session_id}, exception=e)
+        return error_response(500, "Failed to upload logo", context={"session_id": session_id}, exception=e)
 
 
 @router.get("/roster/logo/{session_id}")
-async def get_logo(session_id: str):
+def get_logo(session_id: str):
     """Get the custom logo for the roster"""
     try:
         session = get_session(session_id)
@@ -439,29 +554,40 @@ async def get_logo(session_id: str):
         if not custom_logo or not custom_logo.get('uploaded'):
             return error_response(404, "No custom logo found", context={"session_id": session_id})
 
-        logo_data = bytes.fromhex(custom_logo.get('data', ''))
+        import base64
+        from session_manager import _get_redis, _is_encrypted, _decrypt_data
+        logo_key = f"{session_id}_logo"
+        raw_logo = _get_redis().get(logo_key)
+        if not raw_logo:
+            return error_response(404, "Logo data not found or expired", context={"session_id": session_id})
+        if _is_encrypted(raw_logo):
+            raw_logo = _decrypt_data(raw_logo)
+        logo_data = base64.b64decode(raw_logo)
         content_type = custom_logo.get('content_type', 'image/png')
 
         return StreamingResponse(
             io.BytesIO(logo_data),
             media_type=content_type,
             headers={
-                "Content-Disposition": f"inline; filename={custom_logo.get('filename', 'logo.png')}"
+                "Content-Disposition": f'inline; filename="{custom_logo.get("filename", "logo.png")}"'
             }
         )
 
     except Exception as e:
-        return error_response(500, f"Failed to get logo: {str(e)}", context={"session_id": session_id}, exception=e)
+        return error_response(500, "Failed to get logo", context={"session_id": session_id}, exception=e)
 
 
 @router.delete("/roster/logo/{session_id}")
-async def delete_logo(session_id: str):
+def delete_logo(session_id: str):
     """Delete the custom logo for the roster"""
     try:
         session = get_session(session_id)
 
         if not session:
             return error_response(404, "Session not found or expired", context={"session_id": session_id})
+
+        from session_manager import _get_redis
+        _get_redis().delete(f"{session_id}_logo")
 
         update_session(
             session_id,
@@ -475,13 +601,16 @@ async def delete_logo(session_id: str):
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to delete logo: {str(e)}", context={"session_id": session_id}, exception=e)
+        return error_response(500, "Failed to delete logo", context={"session_id": session_id}, exception=e)
 
 
 @router.post("/roster/reprocess/{session_id}")
-async def reprocess_roster(session_id: str, data: Dict = Body(...)):
+async def reprocess_roster(session_id: str, data: Optional[Dict] = Body(default=None)):
     """Reprocess the roster with updated eligibility rules"""
     try:
+        # Body is optional — the frontend triggers reprocess with no payload.
+        data = data or {}
+
         session = get_session(session_id)
 
         if not session:
@@ -497,7 +626,10 @@ async def reprocess_roster(session_id: str, data: Dict = Body(...)):
             return error_response(400, "No roster data found to reprocess", context={"session_id": session_id})
 
         dataframe = pd.DataFrame(dataframe_list)
-        pdf_dataframe = pd.DataFrame(pdf_list) if pdf_list else pd.DataFrame()
+        cycle = session.get('cycle', 'SSG')
+        year = session.get('year', 2025)
+
+        await asyncio.to_thread(roster_processor, dataframe, session_id, cycle, year)
 
         update_session(
             session_id,
@@ -514,4 +646,4 @@ async def reprocess_roster(session_id: str, data: Dict = Body(...)):
         })
 
     except Exception as e:
-        return error_response(500, f"Failed to reprocess roster: {str(e)}", context={"session_id": session_id}, exception=e)
+        return error_response(500, "Failed to reprocess roster", context={"session_id": session_id}, exception=e)

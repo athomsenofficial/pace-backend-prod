@@ -13,21 +13,21 @@ The actual definitions now live in:
 from config.settings import (
     cors_origins, allowed_types, session_ttl,
     SESSION_REQUIRED_KEYS, SESSION_ID_LENGTH, SESSION_CLEANUP_INTERVAL,
-    images_dir, default_logo, afpc_logo,
+    TEMP_DIR, images_dir, default_logo, afpc_logo,
     MAX_FILE_SIZE_MB, ALLOWED_FILE_EXTENSIONS,
     small_unit_threshold, max_name_length, max_unit_length,
     date_input_format, date_display_format, ACCOUNTING_DATE_OFFSET_DAYS,
-    DATA_VALIDATION_ERRORS, HTTP_STATUS_CODES, API_RESPONSES,
+    DATA_VALIDATION_ERRORS, API_RESPONSES,
     LOG_LEVELS, LOG_FORMAT,
     MAX_RECORDS_PER_PDF, MAX_PASCODES_PER_SESSION, PDF_GENERATION_TIMEOUT,
     MAX_DATAFRAME_MEMORY_MB, CHUNK_SIZE_FOR_LARGE_FILES,
-    FEATURES,
 )
 
 from config.domain import (
     GRADE_MAP, PROMOTION_MAP, PROMOTIONAL_MAP, BOARDS,
     OFFICER_RANKS, ENLISTED_RANKS,
     SCODS, TIG, TIG_MONTHS_REQUIRED, TAFMSD, MDOS,
+    BOARD_DOR_CUTOFF, BOARD_TAFMSD_CUTOFF,
     MAIN_HIGHER_TENURE, EXCEPTION_HIGHER_TENURE,
     hyt_start_date, hyt_end_date,
     PAFSC_MAP, RE_CODES,

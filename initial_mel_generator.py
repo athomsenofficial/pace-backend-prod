@@ -1,7 +1,7 @@
+import logging
+import uuid
 import pandas as pd
 import os
-from io import BytesIO
-from fastapi.responses import StreamingResponse
 from reportlab.platypus import PageBreak
 from reportlab.lib.units import inch
 
@@ -10,9 +10,12 @@ from session_manager import get_session
 from constants import (
     INITIAL_MEL_HEADER_ROW, INITIAL_MEL_INELIGIBLE_HEADER_ROW,
     INITIAL_MEL_TABLE_WIDTHS, INITIAL_MEL_INELIGIBLE_TABLE_WIDTHS,
-    images_dir, default_logo, PDF_MARGIN
+    images_dir, default_logo, PDF_MARGIN, TEMP_DIR
 )
 from pdf_templates import PDF_Template, create_table, merge_pdfs
+from pdf_utils import format_sig_name, clean_dataframe, resolve_commander_name
+
+logger = logging.getLogger(__name__)
 
 class InitialMELDocument(PDF_Template):
     """Document template for Initial MEL reports, inheriting from the base template."""
@@ -54,25 +57,8 @@ def generate_pascode_pdf(eligible_data, ineligible_data, discrepancy_data, btz_d
         doc.build(elements)
         return output_filename
     except Exception as e:
-        print(f"Error generating PDF for pascode {pascode}: {e}")
+        logger.error(f"Error generating PDF for pascode {pascode}: {e}")
         return None
-
-def _format_sig_name(first, middle, last, fallback='N/A'):
-    """Format name for signature block: FIRST M. LAST"""
-    first = (first or '').strip()
-    middle = (middle or '').strip()
-    last = (last or '').strip()
-    if first or last:
-        parts = []
-        if first:
-            parts.append(first)
-        if middle:
-            mi = middle if middle.endswith('.') else middle[0] + '.'
-            parts.append(mi)
-        if last:
-            parts.append(last)
-        return ' '.join(parts).upper()
-    return (fallback or 'N/A').upper()
 
 
 def generate_small_unit_pdf(small_unit_data, senior_rater, cycle, melYear, pas_info, base_filename, logo_path):
@@ -89,7 +75,7 @@ def generate_small_unit_pdf(small_unit_data, senior_rater, cycle, melYear, pas_i
         doc.pas_info = {
             'srid': senior_rater.get('srid', 'N/A'),
             'fd name': senior_rater.get('senior_rater_name', 'N/A'),
-            'signature_name': _format_sig_name(
+            'signature_name': format_sig_name(
                 senior_rater.get('senior_rater_first_name', ''),
                 senior_rater.get('senior_rater_middle_name', ''),
                 senior_rater.get('senior_rater_last_name', ''),
@@ -109,7 +95,7 @@ def generate_small_unit_pdf(small_unit_data, senior_rater, cycle, melYear, pas_i
         doc.build(elements)
         return small_unit_filename
     except Exception as e:
-        print(f"Error generating small unit PDF: {e}")
+        logger.error(f"Error generating small unit PDF: {e}")
         return None
 
 def generate_roster_pdf(session_id, output_filename, logo_path=None):
@@ -117,46 +103,8 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
     try:
         session = get_session(session_id)
         if not session:
-            print(f"Error: Session {session_id} not found or expired")
+            logger.error(f"Session {session_id} not found or expired")
             return None
-
-        # Safely get data with defaults
-        def clean_dataframe(records):
-            """Clean dataframe by removing deleted records and internal columns"""
-            df = pd.DataFrame.from_records(records) if records else pd.DataFrame()
-
-            # Filter out soft-deleted records
-            if 'deleted' in df.columns:
-                df = df[df['deleted'] != True]
-
-            # Remove internal delete-related columns AND any UI-only columns
-            columns_to_drop = ['deleted', 'deletion_reason', 'member_id',
-                              'REENL_ELIG_STATUS', 'UIF_CODE', 'UIF_DISPOSITION_DATE',
-                              'GRADE_PERM_PROJ', '2AFSC', '3AFSC', '4AFSC']
-            for col in columns_to_drop:
-                if col in df.columns:
-                    df = df.drop(columns=[col])
-
-            # Ensure only PDF-appropriate columns remain
-            # Keep only columns that were originally in the data
-            from constants import PDF_COLUMNS
-            expected_cols = PDF_COLUMNS + ['REASON', 'SSAN', 'PAFSC']  # Include some extra cols that might be needed
-
-            # Filter to only keep expected columns
-            df_cols = df.columns.tolist()
-            cols_to_keep = [col for col in df_cols if col in expected_cols or col in ['FULL_NAME', 'GRADE', 'DATE_ARRIVED_STATION', 'DAFSC', 'ASSIGNED_PAS_CLEARTEXT', 'DOR', 'TAFMSD', 'ASSIGNED_PAS', 'REASON']]
-            if cols_to_keep:
-                df = df[cols_to_keep]
-
-            if 'FULL_NAME' in df.columns and not df.empty:
-                df = df.sort_values(
-                    by='FULL_NAME',
-                    key=lambda s: s.astype(str).str.upper(),
-                    kind='stable',
-                    na_position='last',
-                ).reset_index(drop=True)
-
-            return df
 
         eligible_df = clean_dataframe(session.get('eligible_df', []))
         ineligible_df = clean_dataframe(session.get('ineligible_df', []))
@@ -170,47 +118,42 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
         if not logo_path:
             logo_path = os.path.join(images_dir, default_logo)
         eligible_data = eligible_df.values.tolist() if not eligible_df.empty else []
+        eligible_cols = eligible_df.columns.tolist() if not eligible_df.empty else []
+        pas_idx = eligible_cols.index('ASSIGNED_PAS') if 'ASSIGNED_PAS' in eligible_cols else 7
         btz_data = btz_df.values.tolist() if not btz_df.empty else []
+        btz_cols = btz_df.columns.tolist() if not btz_df.empty else []
+        btz_pas_idx = btz_cols.index('ASSIGNED_PAS') if 'ASSIGNED_PAS' in btz_cols else 7
         ineligible_columns = ['FULL_NAME', 'GRADE', 'ASSIGNED_PAS', 'DAFSC', 'ASSIGNED_PAS_CLEARTEXT', 'REASON']
         available_columns = [col for col in ineligible_columns if col in ineligible_df.columns]
         available_discrepancy_columns = [col for col in ineligible_columns if col in discrepancy_df.columns]
 
         ineligible_data = ineligible_df[available_columns].values.tolist() if not ineligible_df.empty else []
+        ineligible_cols = available_columns if not ineligible_df.empty else []
+        inelig_pas_idx = ineligible_cols.index('ASSIGNED_PAS') if 'ASSIGNED_PAS' in ineligible_cols else 2
         discrepancy_data = discrepancy_df[available_discrepancy_columns].values.tolist() if not discrepancy_df.empty else []
+        discrepancy_cols = available_discrepancy_columns if not discrepancy_df.empty else []
+        discrep_pas_idx = discrepancy_cols.index('ASSIGNED_PAS') if 'ASSIGNED_PAS' in discrepancy_cols else 2
 
 
         unique_pascodes = set()
         for row in eligible_data:
-            if len(row) > 7:
-                unique_pascodes.add(row[7])
+            if len(row) > pas_idx:
+                unique_pascodes.add(row[pas_idx])
         for row in ineligible_data:
-            if len(row) > 2:
-                unique_pascodes.add(row[2])
+            if len(row) > inelig_pas_idx:
+                unique_pascodes.add(row[inelig_pas_idx])
         for row in btz_data:
-            if len(row) > 7:
-                unique_pascodes.add(row[7])
+            if len(row) > btz_pas_idx:
+                unique_pascodes.add(row[btz_pas_idx])
         unique_pascodes = sorted(list(unique_pascodes))
         temp_pdfs = []
         if not unique_pascodes and not small_unit_df.empty and senior_rater:
-            small_unit_temp_filename = f"temp_small_unit.pdf"
-            # Format commander name for FDID - check both commander_* and senior_rater_* fields
-            su_commander_last = senior_rater.get('commander_last_name') or senior_rater.get('senior_rater_last_name', '')
-            su_commander_first = senior_rater.get('commander_first_name') or senior_rater.get('senior_rater_first_name', '')
-            su_commander_middle = senior_rater.get('commander_middle_name') or senior_rater.get('senior_rater_middle_name', '')
-
-            # If we have first/last names, use them; otherwise fall back to senior_rater_name
-            if su_commander_last or su_commander_first:
-                su_commander_name = f"{su_commander_last}, {su_commander_first}"
-                if su_commander_middle:
-                    su_commander_name += f" {su_commander_middle}"
-                su_commander_name = su_commander_name.strip().strip(',')
-            else:
-                su_commander_name = senior_rater.get('senior_rater_name', 'N/A')
-
+            small_unit_temp_filename = f"{TEMP_DIR}/temp_small_unit_{uuid.uuid4().hex[:8]}.pdf"
+            su_commander_name, su_first, su_middle, su_last = resolve_commander_name(senior_rater)
             small_unit_pas_info = {
                 'fdid': f'{senior_rater.get("srid", "")}',
                 'fd name': su_commander_name if su_commander_name else 'N/A',
-                'signature_name': _format_sig_name(su_commander_first, su_commander_middle, su_commander_last, su_commander_name),
+                'signature_name': format_sig_name(su_first, su_middle, su_last, su_commander_name),
                 'srid': senior_rater.get("srid", "N/A"),
                 'srid mpf': senior_rater.get("srid", "")[:2] if senior_rater.get("srid") else 'N/A'
             }
@@ -219,45 +162,31 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             )
             if small_unit_pdf:
                 temp_pdfs.append(small_unit_pdf)
-            return merge_pdfs(temp_pdfs, session_id)
+            return merge_pdfs(temp_pdfs, f"{TEMP_DIR}/initial_mel_{session_id}.pdf")
         for pascode in unique_pascodes:
             if pascode not in pascode_map:
                 continue
-            pascode_eligible = [row for row in eligible_data if len(row) > 7 and row[7] == pascode]
-            pascode_ineligible = [row for row in ineligible_data if len(row) > 2 and row[2] == pascode]
-            pascode_discrepancy = [row for row in discrepancy_data if len(row) > 2 and row[2] == pascode]
-            pascode_btz = [row for row in btz_data if len(row) > 7 and row[7] == pascode]
+            pascode_eligible = [row for row in eligible_data if len(row) > pas_idx and row[pas_idx] == pascode]
+            pascode_ineligible = [row for row in ineligible_data if len(row) > inelig_pas_idx and row[inelig_pas_idx] == pascode]
+            pascode_discrepancy = [row for row in discrepancy_data if len(row) > discrep_pas_idx and row[discrep_pas_idx] == pascode]
+            pascode_btz = [row for row in btz_data if len(row) > btz_pas_idx and row[btz_pas_idx] == pascode]
             if not pascode_eligible and not pascode_ineligible and not pascode_btz:
                 continue
             eligible_candidates = len(pascode_eligible)
             must_promote, promote_now = get_promotion_eligibility(eligible_candidates, cycle)
-            # Format commander name for FD Name - check both commander_* and senior_rater_* fields
-            commander_last = pascode_map[pascode].get('commander_last_name') or pascode_map[pascode].get('senior_rater_last_name', '')
-            commander_first = pascode_map[pascode].get('commander_first_name') or pascode_map[pascode].get('senior_rater_first_name', '')
-            commander_middle = pascode_map[pascode].get('commander_middle_name') or pascode_map[pascode].get('senior_rater_middle_name', '')
-
-            # If we have first/last names, use them; otherwise fall back to senior_rater_name
-            if commander_last or commander_first:
-                commander_name = f"{commander_last}, {commander_first}"
-                if commander_middle:
-                    commander_name += f" {commander_middle}"
-                commander_name = commander_name.strip().strip(',')
-            else:
-                commander_name = pascode_map[pascode].get('senior_rater_name', 'N/A')
-
-            # For large units, use commander info for signature block
+            commander_name, cmd_first, cmd_middle, cmd_last = resolve_commander_name(pascode_map[pascode])
             pas_info = {
                 'srid': pascode_map[pascode].get('srid', 'N/A'),
                 'rank': pascode_map[pascode].get('commander_rank') or pascode_map[pascode].get('senior_rater_rank', 'N/A'),
                 'title': pascode_map[pascode].get('commander_title') or pascode_map[pascode].get('senior_rater_title', 'N/A'),
                 'fd name': commander_name,
-                'signature_name': _format_sig_name(commander_first, commander_middle, commander_last, commander_name),
+                'signature_name': format_sig_name(cmd_first, cmd_middle, cmd_last, commander_name),
                 'fdid': f'{pascode_map[pascode].get("srid", "")}{pascode[-4:]}',
                 'srid mpf': pascode[:2],
                 'mp': must_promote,
                 'pn': promote_now
             }
-            temp_filename = f"temp_{pascode}.pdf"
+            temp_filename = f"{TEMP_DIR}/temp_{pascode}_{uuid.uuid4().hex[:8]}.pdf"
             temp_pdf = generate_pascode_pdf(
                 pascode_eligible,
                 pascode_ineligible,
@@ -273,25 +202,12 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             if temp_pdf:
                 temp_pdfs.append(temp_pdf)
         if not small_unit_df.empty and senior_rater:
-            small_unit_temp_filename = f"temp_small_unit.pdf"
-            # Format commander name for FDID - check both commander_* and senior_rater_* fields
-            su_commander_last = senior_rater.get('commander_last_name') or senior_rater.get('senior_rater_last_name', '')
-            su_commander_first = senior_rater.get('commander_first_name') or senior_rater.get('senior_rater_first_name', '')
-            su_commander_middle = senior_rater.get('commander_middle_name') or senior_rater.get('senior_rater_middle_name', '')
-
-            # If we have first/last names, use them; otherwise fall back to senior_rater_name
-            if su_commander_last or su_commander_first:
-                su_commander_name = f"{su_commander_last}, {su_commander_first}"
-                if su_commander_middle:
-                    su_commander_name += f" {su_commander_middle}"
-                su_commander_name = su_commander_name.strip().strip(',')
-            else:
-                su_commander_name = senior_rater.get('senior_rater_name', 'N/A')
-
+            small_unit_temp_filename = f"{TEMP_DIR}/temp_small_unit_{uuid.uuid4().hex[:8]}.pdf"
+            su_commander_name, su_first, su_middle, su_last = resolve_commander_name(senior_rater)
             small_unit_pas_info = {
                 'fdid': f'{senior_rater.get("srid", "")}',
                 'fd name': su_commander_name if su_commander_name else 'N/A',
-                'signature_name': _format_sig_name(su_commander_first, su_commander_middle, su_commander_last, su_commander_name),
+                'signature_name': format_sig_name(su_first, su_middle, su_last, su_commander_name),
                 'srid': senior_rater.get("srid", "N/A"),
                 'srid mpf': senior_rater.get("srid", "")[:2] if senior_rater.get("srid") else 'N/A'
             }
@@ -306,7 +222,7 @@ def generate_roster_pdf(session_id, output_filename, logo_path=None):
             )
             if small_unit_pdf:
                 temp_pdfs.append(small_unit_pdf)
-        return merge_pdfs(temp_pdfs, session_id)
+        return merge_pdfs(temp_pdfs, f"{TEMP_DIR}/initial_mel_{session_id}.pdf")
     except Exception as e:
-        print(f"Error generating roster PDF: {e}")
+        logger.error(f"Error generating roster PDF: {e}")
         return None

@@ -4,6 +4,7 @@ import pandas as pd
 from date_parsing import parse_date
 from constants import (
     SCODS, TIG, TIG_MONTHS_REQUIRED, TAFMSD, MDOS,
+    BOARD_DOR_CUTOFF, BOARD_TAFMSD_CUTOFF,
     MAIN_HIGHER_TENURE, EXCEPTION_HIGHER_TENURE, PAFSC_MAP,
     RE_CODES, hyt_start_date, hyt_end_date
 )
@@ -11,7 +12,6 @@ from typing import Union, Tuple, Optional
 from classes import EligibilityResult
 from eligibility_calculators import compute_hyt_date
 from logging import Logger
-from logging_config import to_initials
 
 def pafsc_check(grade: str, pafsc: Optional[str], two_afsc: Optional[str],
                  three_afsc: Optional[str], four_afsc: Optional[str]) -> Optional[bool]:
@@ -56,7 +56,7 @@ def pafsc_check(grade: str, pafsc: Optional[str], two_afsc: Optional[str],
 
     return False
 
-def btz_elgibility_check(date_of_rank, year):
+def btz_eligibility_check(date_of_rank, year):
     date_of_rank = parse_date(date_of_rank)
     if not date_of_rank:
         return False
@@ -69,7 +69,7 @@ def btz_elgibility_check(date_of_rank, year):
         return True
     return False
 
-def check_a1c_eligbility(date_of_rank, year):
+def check_a1c_eligibility(date_of_rank, year):
     date_of_rank = parse_date(date_of_rank)
     if not date_of_rank:
         return False
@@ -105,38 +105,71 @@ def board_filter(
     member_name: str = "Unknown",
     roster_type: str = "mel",
     logger: Optional[Logger] = None
-) -> Union[bool, Tuple[bool, str], Tuple[str, str], None]:
+) -> EligibilityResult:
     """
-    Filter members for board eligibility.
-    Logs a single PASS/FAIL line per member with initials only.
-    """
-    initials = to_initials(member_name)
+    Filter members for board eligibility with comprehensive logging.
 
-    def _log_result(status, reason=None):
-        if logger:
-            msg = f"{initials} | {status}"
-            if reason:
-                msg += f" | {reason}"
-            if status == "FAIL":
-                logger.warning(msg)
-            else:
+    Args:
+        grade: Member's current grade
+        year: Board year
+        date_of_rank: Date member received current rank
+        uif_code: Unfavorable Information File code (can be NaN)
+        uif_disposition_date: UIF disposition date (can be None/NaN)
+        tafmsd: Total Active Federal Military Service Date
+        re_status: Reenlistment Eligibility status code (can be None/NaN)
+        pafsc: Primary Air Force Specialty Code (can be None/NaN)
+        two_afsc: Second AFSC (can be None/NaN)
+        three_afsc: Third AFSC (can be None/NaN)
+        four_afsc: Fourth AFSC (can be None/NaN)
+        member_name: Member's name (for logging)
+        logger: Logger instance (optional, if None no logging)
+
+    Returns:
+        EligibilityResult with status: "eligible", "ineligible", "btz", "discrepancy", or "skip"
+    """
+    try:
+        # Helper functions for conditional logging
+        def log_info(msg):
+            if logger:
                 logger.info(msg)
 
-    try:
+        def log_warning(msg):
+            if logger:
+                logger.warning(msg)
+
+        def log_error(msg, exc_info=False):
+            if logger:
+                logger.error(msg, exc_info=exc_info)
+
+        log_info(f"{'='*60}")
+        log_info(f"PROCESSING: {member_name}")
+        log_info(f"Grade: {grade} | Year: {year}")
+        log_info(f"Input Data - DOR: {date_of_rank}, TAFMSD: {tafmsd}, UIF: {uif_code}")
+
         # Step 1: Parse dates
+        log_info(f"Step 1: Parsing dates")
         date_of_rank = parse_date(date_of_rank)
         uif_disposition_date = parse_date(uif_disposition_date)
         tafmsd = parse_date(tafmsd)
+        log_info(f"  Parsed DOR: {date_of_rank}")
+        log_info(f"  Parsed TAFMSD: {tafmsd}")
+        log_info(f"  Parsed UIF Disposition: {uif_disposition_date}")
 
+        # REMOVED the strict None check that was causing all members to be ineligible
+        # Only check for required dates that must be present
         if date_of_rank is None or tafmsd is None:
             reason = 'Required date missing or unreadable'
-            _log_result("FAIL", reason)
+            log_warning(f"  FAILED: {reason}")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("ineligible", reason)
 
         # Step 2: Calculate key dates
-        scod_month_day = SCODS.get(grade)
-        month_name = scod_month_day.split('-')[1]
+        log_info(f"Step 2: Calculating key dates and thresholds")
+        # Determine SCOD year based on month
+        scod_month_day = SCODS.get(grade)  # e.g., '31-JAN'
+        month_name = scod_month_day.split('-')[1]  # e.g., 'JAN'
 
+        # SCODs in Jan-Mar use year+1, others use year
         if month_name in ['JAN', 'FEB', 'MAR']:
             scod_year = year + 1
         else:
@@ -144,124 +177,216 @@ def board_filter(
 
         scod = f'{scod_month_day}-{scod_year}'
         scod_as_datetime = datetime.strptime(scod, "%d-%b-%Y")
-
-        tig_selection_month = f'{TIG.get(grade)}-{year + 1}'
-        formatted_tig_selection_month = datetime.strptime(tig_selection_month, "%d-%b-%Y")
-        tig_eligibility_month = formatted_tig_selection_month - relativedelta(months=TIG_MONTHS_REQUIRED.get(grade))
+        log_info(f"  SCOD (Selection Cutoff Date): {scod_as_datetime.strftime('%d-%b-%Y')}")
 
         tafmsd_years = TAFMSD.get(grade)
-        if tafmsd_years < 1:
-            months_total = int(tafmsd_years * 12)
-            tafmsd_required_date = formatted_tig_selection_month - relativedelta(months=months_total)
+        if grade in BOARD_DOR_CUTOFF:
+            # E5-E9 boards: use official chart cutoffs directly. DOR and TAFMSD
+            # have independent per-grade anchors, so they are NOT derived from a
+            # single shared selection-month anchor.
+            _m, _d, _off = BOARD_DOR_CUTOFF[grade]
+            tig_eligibility_month = datetime(year + _off, _m, _d)
+            _tm, _td, _toff = BOARD_TAFMSD_CUTOFF[grade]
+            tafmsd_required_date = datetime(year + _toff, _tm, _td)
         else:
-            months_component = int((tafmsd_years % 1) * 12)
-            years_component = int(tafmsd_years)
-            tafmsd_required_date = formatted_tig_selection_month - relativedelta(years=years_component,
-                                                                                 months=months_component)
+            # Legacy single-anchor formula for non-board grades (AB/AMN/A1C).
+            tig_selection_month = f'{TIG.get(grade)}-{year + 1}'
+            formatted_tig_selection_month = datetime.strptime(tig_selection_month, "%d-%b-%Y")
+            tig_eligibility_month = formatted_tig_selection_month - relativedelta(months=TIG_MONTHS_REQUIRED.get(grade))
+            if tafmsd_years < 1:
+                months_total = int(tafmsd_years * 12)
+                tafmsd_required_date = formatted_tig_selection_month - relativedelta(months=months_total)
+            else:
+                months_component = int((tafmsd_years % 1) * 12)
+                years_component = int(tafmsd_years)
+                tafmsd_required_date = formatted_tig_selection_month - relativedelta(years=years_component,
+                                                                                     months=months_component)
+        log_info(f"  TIG Eligibility Month: {tig_eligibility_month.strftime('%d-%b-%Y')} (requires {TIG_MONTHS_REQUIRED.get(grade)} months TIG)")
+        log_info(f"  TAFMSD Required Date: {tafmsd_required_date.strftime('%d-%b-%Y')} (requires {tafmsd_years} years TIS)")
 
+        hyt_years = MAIN_HIGHER_TENURE.get(grade)
         hyt_date = compute_hyt_date(tafmsd, grade)
+        log_info(f"  HYT Date: {hyt_date.strftime('%d-%b-%Y')} ({hyt_years} years)")
 
         mdos_month = f'{MDOS.get(grade)}-{year + 1}'
         mdos = datetime.strptime(mdos_month, "%d-%b-%Y")
+        log_info(f"  MDOS (Mandatory Date of Separation): {mdos.strftime('%d-%b-%Y')}")
 
         btz_check = None
 
-        # Step 3: A1C specific checks
+        # Step 3: A1C -> SrA projection.
+        # The SrA (E5) cycle roster includes A1Cs who are about to pin Senior
+        # Airman. We project their SrA date-of-rank and, if they will be a SrA
+        # by the SCOD, re-evaluate them AS a SrA (reusing the SrA gates below:
+        # the 1-Feb cutoff and the 2-Feb..31-Mar window). Buckets:
+        #   projected pin <= 1 Feb (cutoff)      -> continues as SrA -> eligible
+        #   1 Feb < pin <= 31 Mar (SCOD)         -> continues as SrA -> ineligible (Feb-Mar window)
+        #   pin > SCOD but BTZ-eligible          -> BTZ page
+        #   pin > SCOD and not BTZ               -> skip (off MEL)
         if grade == 'A1C':
-            if three_year_tafmsd_check(scod_as_datetime, tafmsd):
-                reason = 'SRA 2 Feb - 31 Mar or 3yr TIS'
-                _log_result("FAIL", reason)
-                return EligibilityResult("ineligible", reason)
+            log_info(f"Step 3: A1C -> SrA projection")
+            # Projected standard SrA pin, whichever comes first (DAFI 36-2502):
+            #   28 months TIG, OR (36 months TIS AND 20 months TIG)
+            tig_28 = date_of_rank + relativedelta(months=28)
+            tis_36 = max(tafmsd + relativedelta(months=36), date_of_rank + relativedelta(months=20))
+            standard_pin = min(tig_28, tis_36)
+            # BTZ: considered 6 months early on the 28-month TIG line (22 months TIG)
+            btz_pin = date_of_rank + relativedelta(months=22)
+            log_info(f"  Projected SrA pin (standard): {standard_pin.strftime('%d-%b-%Y')} | BTZ pin: {btz_pin.strftime('%d-%b-%Y')} | SCOD: {scod_as_datetime.strftime('%d-%b-%Y')}")
 
-            eligibility_status = check_a1c_eligbility(date_of_rank, year)
-            if eligibility_status is None:
-                btz_check = btz_elgibility_check(date_of_rank, year)
-                if not btz_check:
-                    _log_result("SKIP")
-                    return EligibilityResult("skip")
-            elif eligibility_status is False:
-                reason = 'Failed A1C Check.'
-                _log_result("FAIL", reason)
-                return EligibilityResult("ineligible", reason)
+            if standard_pin <= scod_as_datetime:
+                # Will be a SrA by the SCOD: evaluate as a SrA with the projected DOR.
+                log_info(f"  A1C will pin SrA by SCOD -> re-evaluating as SRA with DOR {standard_pin.strftime('%d-%b-%Y')}")
+                grade = 'SRA'
+                date_of_rank = standard_pin
+                # Recompute SrA-specific thresholds (Step 2 computed them for A1C).
+                _m, _d, _off = BOARD_DOR_CUTOFF['SRA']
+                tig_eligibility_month = datetime(year + _off, _m, _d)
+                _tm, _td, _toff = BOARD_TAFMSD_CUTOFF['SRA']
+                tafmsd_required_date = datetime(year + _toff, _tm, _td)
+                hyt_years = MAIN_HIGHER_TENURE.get('SRA')
+                hyt_date = compute_hyt_date(tafmsd, 'SRA')
+                mdos = datetime.strptime(f"{MDOS.get('SRA')}-{year + 1}", "%d-%b-%Y")
+                tafmsd_years = TAFMSD.get('SRA')
+            elif btz_pin <= scod_as_datetime:
+                log_info(f"  BTZ-eligible (would pin SrA by SCOD via BTZ) -> BTZ page")
+                log_info(f"{'='*60}\n")
+                return EligibilityResult("btz")
+            else:
+                log_info(f"  Will not be a SrA by SCOD and not BTZ-eligible -> off MEL")
+                log_info(f"{'='*60}\n")
+                return EligibilityResult("skip")
+        else:
+            log_info(f"Step 3: Skipping A1C check (not applicable for {grade})")
 
-        # Step 4: 3-year TIS check for AMN and AB only
+        # Step 4: 3-year TIS check for AMN and AB only (A1C checked in Step 3)
         if grade in ('AMN', 'AB'):
+            log_info(f"Step 4: 3-Year TIS Check for {grade}")
             if three_year_tafmsd_check(scod_as_datetime, tafmsd):
                 reason = 'SRA 2 Feb - 31 Mar or 3yr TIS'
-                _log_result("FAIL", reason)
+                log_warning(f"  FAILED: {reason}")
+                log_info(f"{'='*60}\n")
                 return EligibilityResult("ineligible", reason)
+            log_info(f"  PASSED: 3-year TIS check")
+        else:
+            log_info(f"Step 4: Skipping 3-year TIS check (not applicable for {grade})")
 
         # Step 4.5: SRA Feb-March promotion window exclusion
         if grade == 'SRA':
+            log_info(f"Step 4.5: SRA Feb-March Promotion Window Check")
+
+            # Check if DOR is between Feb 2 and March 31 of the PROMOTION YEAR (year + 1)
+            # For 2025 cycle, promotion is Sept 2026, so exclusion is Feb 2, 2026 - Mar 31, 2026
             promotion_year = year + 1
             dor_year = date_of_rank.year
             dor_month = date_of_rank.month
             dor_day = date_of_rank.day
 
+            # Only check if DOR is in the promotion year
             if dor_year == promotion_year:
+                # Feb 2 - Feb 29 (month=2, day>=2) OR Mar 1 - Mar 31 (month=3)
                 if (dor_month == 2 and dor_day >= 2) or (dor_month == 3):
                     reason = 'SRA 2 Feb - 31 Mar or 3yr TIS'
-                    _log_result("FAIL", reason)
+                    log_warning(f"  FAILED: Promoted to SRA during ineligible window (Feb 2 - Mar 31, {promotion_year})")
+                    log_info(f"{'='*60}\n")
                     return EligibilityResult("ineligible", reason)
 
+            log_info(f"  PASSED: DOR not in Feb 2 - Mar 31, {promotion_year} exclusion window")
+        else:
+            log_info(f"Step 4.5: Skipping SRA Feb-March check (not applicable for {grade})")
+
         # Step 5: TIG check
+        log_info(f"Step 5: Time in Grade (TIG) Check")
         if date_of_rank is None or date_of_rank > tig_eligibility_month:
             reason = f'TIG: < {TIG_MONTHS_REQUIRED.get(grade)} months'
-            _log_result("FAIL", reason)
+            log_warning(f"  FAILED: DOR {date_of_rank.strftime('%d-%b-%Y') if date_of_rank else 'None'} is after required {tig_eligibility_month.strftime('%d-%b-%Y')}")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("ineligible", reason)
+        log_info(f"  PASSED: DOR {date_of_rank.strftime('%d-%b-%Y')} is before {tig_eligibility_month.strftime('%d-%b-%Y')}")
 
         # Step 6: TIS check
+        log_info(f"Step 6: Time in Service (TIS) Check")
         if tafmsd > tafmsd_required_date:
             reason = f'TIS < {TAFMSD.get(grade)} years'
-            _log_result("FAIL", reason)
+            log_warning(f"  FAILED: TAFMSD {tafmsd.strftime('%d-%b-%Y')} is after required {tafmsd_required_date.strftime('%d-%b-%Y')}")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("ineligible", reason)
+        log_info(f"  PASSED: TAFMSD {tafmsd.strftime('%d-%b-%Y')} is before {tafmsd_required_date.strftime('%d-%b-%Y')}")
 
-        # Step 7: HYT check
+        # Step 7: HYT check with exception handling
+        log_info(f"Step 7: High Year of Tenure (HYT) Check")
         if hyt_date < mdos:
             reason = 'Higher tenure.'
-            _log_result("FAIL", reason)
+            log_warning(f"  FAILED: HYT date {hyt_date.strftime('%d-%b-%Y')} is before MDOS {mdos.strftime('%d-%b-%Y')}")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("ineligible", reason)
+        log_info(f"  PASSED: HYT date {hyt_date.strftime('%d-%b-%Y')} is after MDOS {mdos.strftime('%d-%b-%Y')}")
 
         # Step 8: UIF check
+        log_info(f"Step 8: UIF Code Check")
+        # Handle NaN/None/empty UIF code
         if pd.isna(uif_code) or uif_code is None or uif_code == '':
             uif_code = 0
+            log_info(f"  UIF Code: 0 (no UIF or empty value)")
         else:
             try:
                 uif_code = int(uif_code)
+                log_info(f"  UIF Code: {uif_code}")
             except (TypeError, ValueError):
                 uif_code = 0
-
+                log_info(f"  UIF Code: 0 (invalid value converted to 0)")
+        # Allow uif_disposition_date to be None since it's optional
         if uif_code > 1 and uif_disposition_date and uif_disposition_date < scod_as_datetime:
             reason = f'UIF code: {uif_code}'
-            _log_result("PASS", f"DISCREPANCY: {reason}")
+            log_warning(f"  DISCREPANCY: {reason} with disposition date {uif_disposition_date.strftime('%d-%b-%Y')} before SCOD")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("discrepancy", reason) if roster_type == 'mel' else EligibilityResult("eligible")
+        log_info(f"  PASSED: No UIF issues")
 
         # Step 9: RE status check
+        log_info(f"Step 9: Reenlistment Eligibility (RE) Status Check")
+        # Handle NaN/None for RE status
         if pd.isna(re_status) or re_status is None:
             re_status = None
-
+            log_info(f"  RE Status: None (empty or not provided)")
+        else:
+            log_info(f"  RE Status: {re_status}")
+        # Only check if RE status is not None
         if re_status and re_status in RE_CODES.keys():
             reason = f'{re_status}: {RE_CODES.get(re_status)}'
-            _log_result("PASS", f"DISCREPANCY: {reason}")
+            log_warning(f"  DISCREPANCY: {reason}")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("discrepancy", reason) if roster_type == 'mel' else EligibilityResult("eligible")
+        log_info(f"  PASSED: RE status is acceptable")
 
         # Step 10: PAFSC skill level check
+        log_info(f"Step 10: PAFSC Skill Level Check")
         if grade not in ('SMS', 'MSG') and roster_type == 'mel':
+            log_info(f"  Checking PAFSC: {pafsc}, 2nd: {two_afsc}, 3rd: {three_afsc}, 4th: {four_afsc}")
             pafsc_result = pafsc_check(grade, pafsc, two_afsc, three_afsc, four_afsc)
+            log_info(f"  PAFSC check result: {pafsc_result}")
             if pafsc_result is False:
                 reason = 'Insufficient PAFSC skill level.'
-                _log_result("PASS", f"DISCREPANCY: {reason}")
+                log_warning(f"  DISCREPANCY: {reason}")
+                log_info(f"{'='*60}\n")
                 return EligibilityResult("discrepancy", reason) if roster_type == 'mel' else EligibilityResult("eligible")
+            log_info(f"  PASSED: PAFSC skill level is sufficient")
+        else:
+            log_info(f"  Skipping PAFSC check for {grade}")
 
         # Final determination
+        log_info(f"Step 11: Final Eligibility Determination")
         if btz_check is not None and btz_check is True:
-            _log_result("PASS", "BTZ")
+            log_info(f"  ELIGIBLE (BTZ): {member_name} meets all requirements and qualifies for BTZ")
+            log_info(f"{'='*60}\n")
             return EligibilityResult("btz")
-
-        _log_result("PASS")
+        log_info(f"  ELIGIBLE: {member_name} meets all requirements")
+        log_info(f"{'='*60}\n")
         return EligibilityResult("eligible")
-
     except Exception as e:
-        error_msg = f'Processing error: {str(e)}'
-        _log_result("FAIL", error_msg)
-        return EligibilityResult("ineligible", error_msg)
+        log_error(f"  EXCEPTION: Processing error: {e}", exc_info=True)
+        log_info(f"{'='*60}\n")
+        # Do NOT coerce an internal error into 'ineligible' — a bug or bad cell
+        # would silently exclude a possibly-eligible member with no surfaced error.
+        # Flag for manual review instead; the exception detail is captured in the log.
+        return EligibilityResult("discrepancy", "Processing error during eligibility check — flagged for manual review")

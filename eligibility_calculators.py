@@ -138,7 +138,7 @@ def calculate_promotion_eligibility(
         return result
 
     except Exception as e:
-        return {"error": f"Calculation error: {str(e)}"}
+        return {"error": "An error occurred during eligibility calculation"}
 
 
 def calculate_btz_eligibility(
@@ -238,4 +238,4 @@ def calculate_btz_eligibility(
         return result
 
     except Exception as e:
-        return {"error": f"BTZ calculation error: {str(e)}"}
+        return {"error": "An error occurred during BTZ eligibility calculation"}

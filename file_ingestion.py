@@ -8,6 +8,7 @@ from constants import (
     allowed_types, MAX_FILE_SIZE_MB,
     MIN_PROMOTION_CYCLE_YEAR, MAX_PROMOTION_CYCLE_YEAR,
     REQUIRED_COLUMNS, OPTIONAL_COLUMNS, PDF_COLUMNS,
+    MAX_RECORDS_PER_PDF, MAX_DATAFRAME_MEMORY_MB,
 )
 
 VALID_CYCLES = ["SRA", "SSG", "TSG", "MSG", "SMS"]
@@ -72,11 +73,28 @@ def ingest_file(contents: bytes, filename: str, logger=None) -> pd.DataFrame:
 
     log("info", f"  File parsed successfully: {len(df)} rows, {len(df.columns)} columns")
 
-    # Filter empty rows
+    # Filter empty rows first (so limits apply to real data only)
     initial_rows = len(df)
     df = df.dropna(how="all")
     if len(df) < initial_rows:
         log("info", f"  Filtered out {initial_rows - len(df)} empty rows")
+
+    # Enforce record count limit
+    if len(df) > MAX_RECORDS_PER_PDF:
+        log("error", f"  FAILED: Too many records ({len(df)}). Maximum is {MAX_RECORDS_PER_PDF}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File contains too many records ({len(df)}). Maximum is {MAX_RECORDS_PER_PDF}.",
+        )
+
+    # Enforce memory limit
+    memory_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+    if memory_mb > MAX_DATAFRAME_MEMORY_MB:
+        log("error", f"  FAILED: DataFrame too large ({memory_mb:.1f}MB). Maximum is {MAX_DATAFRAME_MEMORY_MB}MB")
+        raise HTTPException(
+            status_code=400,
+            detail=f"File data exceeds memory limit ({memory_mb:.0f}MB). Maximum is {MAX_DATAFRAME_MEMORY_MB}MB.",
+        )
 
     # Normalize columns
     df.columns = df.columns.str.strip().str.upper()
@@ -137,8 +155,6 @@ def _parse_xlsx(contents: bytes, logger=None) -> pd.DataFrame:
     try:
         df = pd.read_excel(io.BytesIO(contents), sheet_name=0, engine="openpyxl")
     except TypeError:
-        # openpyxl can choke on Excel files with complex styling (e.g. fills, gradients).
-        # Fall back to loading with data_only to strip problematic style objects.
         if logger:
             logger.warning("  openpyxl styling error, retrying with data_only workbook")
         wb = openpyxl.load_workbook(io.BytesIO(contents), data_only=True, read_only=True)
@@ -167,5 +183,4 @@ def _parse_xlsx(contents: bytes, logger=None) -> pd.DataFrame:
                 return test_df
     wb.close()
 
-    # All sheets empty - return the first sheet empty DataFrame
     return df

@@ -1,6 +1,7 @@
+import asyncio
 import os
 import uuid
-from fastapi import APIRouter, Form, UploadFile, File, Query
+from fastapi import APIRouter, Form, Request, UploadFile, File, Query
 from error_handling import error_response
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
@@ -11,8 +12,12 @@ from initial_mel_generator import generate_roster_pdf
 from mpf_list_generator import generate_mpf_list_pdf
 from mfr_word_generator import generate_mfr_docx
 from classes import PasCodeSubmission
-from file_ingestion import validate_cycle, validate_year, validate_file_type, ingest_file
+from constants import TEMP_DIR
+from file_ingestion import validate_cycle, validate_year, validate_file_type, ingest_file, prepare_session_dataframes
 from logging_config import LoggerSetup
+from starlette.background import BackgroundTask
+from rate_limiter import limiter
+from pdf_utils import cleanup_temp_file
 
 router = APIRouter(tags=["Documents"])
 
@@ -22,7 +27,8 @@ router = APIRouter(tags=["Documents"])
 # ============================================================================
 
 @router.post("/upload/mpf-roster")
-async def upload_mpf_roster(file: UploadFile = File(...), cycle: str = Form(...), year: int = Form(...)):
+@limiter.limit("10/minute")
+async def upload_mpf_roster(request: Request, file: UploadFile = File(...), cycle: str = Form(...), year: int = Form(...)):
     session_id = str(uuid.uuid4())
     cycle = validate_cycle(cycle)
     year = validate_year(year)
@@ -31,52 +37,65 @@ async def upload_mpf_roster(file: UploadFile = File(...), cycle: str = Form(...)
     contents = await file.read()
     try:
         df = ingest_file(contents, file.filename, logger=logger)
-        create_session(session_id, cycle, year)
-        roster_processor(df, session_id, cycle, year, roster_type="mpf")
+        processed_df, pdf_df = prepare_session_dataframes(df)
+        create_session(processed_df, pdf_df, session_id=session_id)
+        update_session(session_id, cycle=cycle, year=year)
+        await asyncio.to_thread(roster_processor, df, session_id, cycle, year, "mpf")
         if not get_session(session_id):
             return error_response(500, "Session creation failed", context={"session_id": session_id, "step": "mpf_upload"})
         LoggerSetup.close_session_logger(session_id)
         return JSONResponse(content={"session_id": session_id, "message": "MPF roster processed", "cycle": cycle, "year": year}, status_code=200)
     except Exception as e:
         LoggerSetup.close_session_logger(session_id)
-        return error_response(500, str(e), context={"session_id": session_id, "step": "mpf_upload"}, exception=e)
+        return error_response(500, "Failed to process MPF roster upload", context={"session_id": session_id, "step": "mpf_upload"}, exception=e)
 
 
 @router.post("/mpf-roster/submit/pascode-info")
-async def submit_mpf_pascode_info(payload: PasCodeSubmission):
+def submit_mpf_pascode_info(payload: PasCodeSubmission):
     try:
         if not get_session(payload.session_id):
-            return error_response(404, "Session not found", context={"session_id": payload.session_id if hasattr(payload, "session_id") else session_id})
+            return error_response(404, "Session not found", context={"session_id": payload.session_id})
         senior_rater_data = {}
-        for p in payload.pascodeInfo:
-            senior_rater_data[p.pascode] = {"srid": p.srid or "N/A", "senior_rater_name": p.senior_rater_name or "N/A", "senior_rater_rank": p.senior_rater_rank or "N/A", "senior_rater_title": p.senior_rater_title or "N/A", "srid mpf": p.srid_mpf or "N/A"}
+        for pascode, info in payload.pascode_info.items():
+            senior_rater_data[pascode] = {"srid": info.srid or "N/A", "senior_rater_name": info.senior_rater_name or "N/A", "senior_rater_rank": info.senior_rater_rank or "N/A", "senior_rater_title": info.senior_rater_title or "N/A"}
         update_session(payload.session_id, senior_rater_data=senior_rater_data)
         return JSONResponse(content={"message": "Data submitted"}, status_code=200)
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return error_response(500, "Failed to process pascode info", context={"session_id": payload.session_id, "step": "mpf_pascode_submit"}, exception=e)
 
 
 @router.get("/download/mpf-roster/{session_id}")
 async def download_mpf_roster(session_id: str, format: str = Query("list")):
+    return await asyncio.to_thread(_download_mpf_roster_sync, session_id, format)
+
+def _download_mpf_roster_sync(session_id: str, format: str):
     try:
         session = get_session(session_id)
         if not session:
-            return error_response(404, "Session not found", context={"session_id": payload.session_id if hasattr(payload, "session_id") else session_id})
+            return error_response(404, "Session not found", context={"session_id": session_id})
         if not session.get("senior_rater_data"):
-            return JSONResponse(content={"error": "Senior rater info required"}, status_code=400)
+            return error_response(400, "Senior rater info required", context={"session_id": session_id})
         logo_path = None
-        if session.get("logo"):
-            logo_path = f"/tmp/{session_id}_logo.png"
-            with open(logo_path, "wb") as f:
-                f.write(session.get("logo"))
-        output = f"/tmp/mpf_{session_id}.pdf"
+        custom_logo = session.get("custom_logo", {})
+        if custom_logo and custom_logo.get("uploaded"):
+            import base64
+            from session_manager import _get_redis, _is_encrypted, _decrypt_data
+            raw_logo = _get_redis().get(f"{session_id}_logo")
+            if raw_logo:
+                if _is_encrypted(raw_logo):
+                    raw_logo = _decrypt_data(raw_logo)
+                logo_data = base64.b64decode(raw_logo)
+                logo_path = f"{TEMP_DIR}/{session_id}_logo.png"
+                with open(logo_path, "wb") as f:
+                    f.write(logo_data)
+        output = f"{TEMP_DIR}/mpf_{session_id}.pdf"
         if format == "list":
             pdf_path = generate_mpf_list_pdf(session_id, output, logo_path)
         elif format == "mel":
             pdf_path = generate_roster_pdf(session_id, output, logo_path)
         elif format == "both":
-            list_pdf = generate_mpf_list_pdf(session_id, f"/tmp/list_{session_id}.pdf", logo_path)
-            mel_pdf = generate_roster_pdf(session_id, f"/tmp/mel_{session_id}.pdf", logo_path)
+            list_pdf = generate_mpf_list_pdf(session_id, f"{TEMP_DIR}/list_{session_id}.pdf", logo_path)
+            mel_pdf = generate_roster_pdf(session_id, f"{TEMP_DIR}/mel_{session_id}.pdf", logo_path)
             if list_pdf and mel_pdf:
                 from pdf_templates import merge_pdfs
                 pdf_path = merge_pdfs([list_pdf, mel_pdf], output)
@@ -86,20 +105,21 @@ async def download_mpf_roster(session_id: str, format: str = Query("list")):
                 except Exception:
                     pass
             else:
-                return JSONResponse(content={"error": "PDF failed"}, status_code=500)
+                return error_response(500, "PDF generation failed", context={"session_id": session_id, "format": format})
         else:
-            return JSONResponse(content={"error": "Invalid format"}, status_code=400)
+            return error_response(400, "Invalid format. Use 'list', 'mel', or 'both'.", context={"session_id": session_id, "format": format})
         if not pdf_path or not os.path.exists(pdf_path):
-            return JSONResponse(content={"error": "PDF failed"}, status_code=500)
+            return error_response(500, "PDF generation failed", context={"session_id": session_id, "format": format})
         if logo_path and os.path.exists(logo_path):
             try:
                 os.remove(logo_path)
             except Exception:
                 pass
         filename = f"MPF_Roster_{session.get('cycle', 'SSG')}_{session.get('year', 2025)}_{format}.pdf"
-        return FileResponse(pdf_path, media_type="application/pdf", filename=filename)
+        return FileResponse(pdf_path, media_type="application/pdf", filename=filename,
+                            background=BackgroundTask(cleanup_temp_file, pdf_path))
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return error_response(500, "Failed to generate MPF roster PDF", context={"session_id": session_id, "step": "mpf_download"}, exception=e)
 
 
 # ============================================================================
@@ -132,10 +152,10 @@ async def generate_mfr_endpoint(payload: MFRRequest):
     Generate a Memorandum for Record (MFR) from structured form data.
     Returns a downloadable Word document.
     """
-    output_path = f"/tmp/mfr_{uuid.uuid4().hex}.docx"
+    output_path = f"{TEMP_DIR}/mfr_{uuid.uuid4().hex}.docx"
 
     try:
-        mfr_data = payload.dict()
+        mfr_data = payload.model_dump()
         result_path = generate_mfr_docx(mfr_data, output_path)
 
         if not result_path or not os.path.exists(result_path):
@@ -151,6 +171,7 @@ async def generate_mfr_endpoint(payload: MFRRequest):
             result_path,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             filename=filename,
+            background=BackgroundTask(cleanup_temp_file, result_path),
         )
 
     except Exception as e:
@@ -159,4 +180,4 @@ async def generate_mfr_endpoint(payload: MFRRequest):
                 os.remove(output_path)
             except Exception:
                 pass
-        return error_response(500, f"Error generating MFR: {str(e)}", context={"step": "mfr_generation"}, exception=e)
+        return error_response(500, "Failed to generate MFR document", context={"step": "mfr_generation"}, exception=e)

@@ -5,6 +5,7 @@ Changes when: deployment environment changes, new origins added, limits adjusted
 """
 
 import os
+import tempfile
 
 # ============================================================================
 # FASTAPI / CORS
@@ -46,12 +47,11 @@ SESSION_CLEANUP_INTERVAL = 3600
 # PATHS
 # ============================================================================
 
+TEMP_DIR = os.getenv("PACE_TEMP_DIR", tempfile.gettempdir())
+
 images_dir = 'images'
 default_logo = 'fiftyonefss.jpeg'
 afpc_logo = 'afpc.png'
-
-font_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'calibri.ttf')
-font_bold_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'fonts', 'calibrib.ttf')
 
 # ============================================================================
 # FILE PROCESSING
@@ -86,20 +86,6 @@ DATA_VALIDATION_ERRORS = {
     'MISSING_REQUIRED_DATA': 'Missing required data',
 }
 
-HTTP_STATUS_CODES = {
-    'SUCCESS': 200,
-    'CREATED': 201,
-    'BAD_REQUEST': 400,
-    'UNAUTHORIZED': 401,
-    'FORBIDDEN': 403,
-    'NOT_FOUND': 404,
-    'METHOD_NOT_ALLOWED': 405,
-    'CONFLICT': 409,
-    'UNPROCESSABLE_ENTITY': 422,
-    'INTERNAL_SERVER_ERROR': 500,
-    'SERVICE_UNAVAILABLE': 503,
-}
-
 API_RESPONSES = {
     'UPLOAD_SUCCESS': 'Upload successful.',
     'PDF_GENERATION_FAILED': 'PDF generation failed',
@@ -132,15 +118,3 @@ PDF_GENERATION_TIMEOUT = 300
 MAX_DATAFRAME_MEMORY_MB = 100
 CHUNK_SIZE_FOR_LARGE_FILES = 1000
 
-# ============================================================================
-# FEATURE FLAGS
-# ============================================================================
-
-FEATURES = {
-    'ENABLE_BTZ_PROCESSING': True,
-    'ENABLE_SMALL_UNIT_PROCESSING': True,
-    'ENABLE_INTERACTIVE_CHECKBOXES': True,
-    'ENABLE_COMPREHENSIVE_LOGGING': True,
-    'ENABLE_DATA_VALIDATION': True,
-    'ENABLE_SESSION_CLEANUP': True,
-}

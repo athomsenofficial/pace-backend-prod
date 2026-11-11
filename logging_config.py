@@ -1,4 +1,5 @@
 import logging
+import logging.handlers
 import os
 import re
 from datetime import datetime
@@ -37,17 +38,6 @@ def mask_name(name: str) -> str:
     return ", ".join(masked_parts)
 
 
-def to_initials(name: str) -> str:
-    """
-    Convert a full name to initials only.
-    Example: "SMITH, JOHN MICHAEL" -> "S.J.M."
-    """
-    if not name or not isinstance(name, str):
-        return "?"
-    clean = name.replace(",", "").split()
-    return ".".join(w[0] for w in clean if w) + "."
-
-
 def mask_pii_in_message(message: str) -> str:
     """
     Scan a log message and mask any potential PII patterns.
@@ -60,9 +50,33 @@ def mask_pii_in_message(message: str) -> str:
 
     return message
 
+
+class PIIMaskingFilter(logging.Filter):
+    """Logging filter that masks PII patterns (e.g. SSNs) in log messages."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = mask_pii_in_message(str(record.msg))
+        return True
+
+
 # Log file paths for general logging
 UPLOAD_LOG_FILE = LOGS_DIR / 'uploads.log'
 GENERAL_LOG_FILE = LOGS_DIR / 'general.log'
+
+
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for production log aggregation."""
+    def format(self, record):
+        import json as json_module
+        log_data = {
+            "timestamp": self.formatTime(record),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            log_data["exception"] = self.formatException(record.exc_info)
+        return json_module.dumps(log_data)
 
 
 class LoggerSetup:
@@ -99,7 +113,9 @@ class LoggerSetup:
             log_file = GENERAL_LOG_FILE
 
         # Create file handler with detailed formatting
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+        )
         file_handler.setLevel(level)
 
         # Create console handler for errors
@@ -107,10 +123,17 @@ class LoggerSetup:
         console_handler.setLevel(logging.ERROR)
 
         # Detailed formatter with timestamp, logger name, level, and message
-        detailed_formatter = logging.Formatter(
-            '%(asctime)s | %(name)s | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        )
+        use_json = os.getenv("PACE_LOG_FORMAT", "text") == "json"
+        if use_json:
+            detailed_formatter = JSONFormatter()
+        else:
+            detailed_formatter = logging.Formatter(
+                '%(asctime)s | %(name)s | %(levelname)s | %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            )
+
+        pii_filter = PIIMaskingFilter()
+        file_handler.addFilter(pii_filter)
 
         file_handler.setFormatter(detailed_formatter)
         console_handler.setFormatter(detailed_formatter)
@@ -152,22 +175,44 @@ class LoggerSetup:
         logger.propagate = False
 
         # Create file handler with detailed formatting
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
-        file_handler.setLevel(level)
-
-        # Detailed formatter with timestamp and message (no logger name needed for session logs)
-        detailed_formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
+        file_handler = logging.handlers.RotatingFileHandler(
+            log_file, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
         )
+        try:
+            file_handler.setLevel(level)
 
-        file_handler.setFormatter(detailed_formatter)
-        logger.addHandler(file_handler)
+            # Detailed formatter with timestamp and message (no logger name needed for session logs)
+            use_json = os.getenv("PACE_LOG_FORMAT", "text") == "json"
+            if use_json:
+                detailed_formatter = JSONFormatter()
+            else:
+                detailed_formatter = logging.Formatter(
+                    '%(asctime)s | %(levelname)s | %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S'
+                )
+
+            pii_filter = PIIMaskingFilter()
+            file_handler.addFilter(pii_filter)
+
+            file_handler.setFormatter(detailed_formatter)
+            logger.addHandler(file_handler)
+        except Exception:
+            try:
+                file_handler.close()
+            except Exception:
+                pass
+            raise
 
         cls._session_loggers[logger_key] = logger
 
         # Log the session start info
-        logger.info(f"ROSTER PROCESSING - {cycle} {year} | Session: {session_id[:8]}")
+        logger.info("=" * 80)
+        logger.info(f"ROSTER PROCESSING LOG - {cycle} {year}")
+        logger.info(f"Session ID: {session_id}")
+        logger.info(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Log File: {log_filename}")
+        logger.info("=" * 80)
+        logger.info("")
 
         return logger
 
@@ -185,7 +230,11 @@ class LoggerSetup:
             logger = cls._session_loggers[logger_key]
 
             # Log session end
+            logger.info("")
+            logger.info("=" * 80)
             logger.info(f"SESSION COMPLETED")
+            logger.info(f"Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("=" * 80)
 
             # Close all handlers
             for handler in logger.handlers[:]:
@@ -198,18 +247,28 @@ class LoggerSetup:
 
 def log_session_start(logger, session_id: str, event_type: str):
     """Log the start of a session processing event"""
-    logger.info(f"SESSION START: {event_type} | {session_id[:8]}")
+    logger.info("=" * 80)
+    logger.info(f"SESSION START: {event_type}")
+    logger.info(f"Session ID: {session_id}")
+    logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 80)
 
 
 def log_session_end(logger, session_id: str, event_type: str, status: str = "SUCCESS"):
     """Log the end of a session processing event"""
-    logger.info(f"SESSION END: {event_type} | {status}")
+    logger.info("-" * 80)
+    logger.info(f"SESSION END: {event_type}")
+    logger.info(f"Session ID: {session_id}")
+    logger.info(f"Status: {status}")
+    logger.info(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("=" * 80)
+    logger.info("")  # Add blank line for readability
 
 
 def log_member_processing(logger, member_name: str, step: str, details: str = None):
     """Log individual member processing steps with PII masking"""
-    initials = to_initials(member_name)
-    msg = f"{initials} | {step}"
+    masked_name = mask_name(member_name)
+    msg = f"Member: {masked_name} | Step: {step}"
     if details:
         msg += f" | {details}"
     logger.info(msg)
@@ -218,15 +277,15 @@ def log_member_processing(logger, member_name: str, step: str, details: str = No
 def log_board_filter_decision(logger, member_name: str, eligible: bool,
                                reason: str = None, is_btz: bool = False):
     """Log board filter eligibility decision with PII masking"""
-    initials = to_initials(member_name)
+    masked_name = mask_name(member_name)
 
-    status = "PASS" if eligible else "FAIL"
+    status = "ELIGIBLE" if eligible else "INELIGIBLE"
     if is_btz:
-        status = "PASS (BTZ)"
+        status = "ELIGIBLE (BTZ)"
 
-    msg = f"{initials} | {status}"
+    msg = f"DECISION: {masked_name} | {status}"
     if reason:
-        msg += f" | {reason}"
+        msg += f" | Reason: {reason}"
 
     if eligible:
         logger.info(msg)

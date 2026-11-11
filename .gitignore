@@ -47,7 +47,3 @@ dist/
 *.bak
 *.swp
 .env
-
-# real env copies, never commit
-.env.backup
-.env.bak.*

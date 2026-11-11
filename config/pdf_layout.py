@@ -4,6 +4,7 @@ PDF generation layout — fonts, dimensions, colors, table configs, MFR constant
 Changes when: the PDF format, fonts, or visual layout changes.
 """
 
+import logging
 import os
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
@@ -27,13 +28,15 @@ font_fallback_bold = 'Helvetica-Bold'
 
 pdf_fonts = (font_fallback, font_fallback_bold)
 
+_logger = logging.getLogger(__name__)
+
 try:
     pdfmetrics.registerFont(TTFont(font_regular, font_path))
     pdfmetrics.registerFont(TTFont(font_bold, font_bold_path))
     pdf_fonts = (font_regular, font_bold)
-    print("Successfully registered custom fonts for PDF generation.")
+    _logger.info("Successfully registered custom fonts for PDF generation.")
 except Exception as e:
-    print(f"Warning: Could not load custom fonts ({e}). Using fallback fonts.")
+    _logger.warning(f"Could not load custom fonts ({e}). Using fallback fonts.")
 
 BODY_FONT, BOLD_FONT = pdf_fonts
 

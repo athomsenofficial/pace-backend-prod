@@ -1,3 +1,4 @@
+import logging
 import os
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
@@ -11,6 +12,8 @@ from reportlab.lib.units import inch
 from PyPDF2 import PdfMerger
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.platypus import Image
+
+logger = logging.getLogger(__name__)
 
 from constants import (
     PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT, PDF_MARGIN, PDF_CONTENT_FRAME_X,
@@ -59,7 +62,7 @@ class PDF_Template(BaseDocTemplate):
             self.add_header(canvas, doc)
             self.add_footer(canvas, doc)
         except Exception as e:
-            print(f"Error adding page elements: {e}")
+            logger.error(f"Error adding page elements: {e}")
         canvas.restoreState()
 
     def add_header(self, canvas, doc):
@@ -79,7 +82,7 @@ class PDF_Template(BaseDocTemplate):
                 logo = Image(doc.logo_path, width=PDF_LOGO_SIZE, height=PDF_LOGO_SIZE)
                 logo.drawOn(canvas, PDF_LOGO_X, header_top - PDF_LOGO_Y_OFFSET)
         except Exception as e:
-            print(f"Error adding logo: {e}")
+            logger.error(f"Error adding logo: {e}")
 
     def _add_unit_data(self, canvas, doc, header_top):
         """Add unit data section."""
@@ -197,7 +200,7 @@ class PDF_Template(BaseDocTemplate):
             adjusted_accounting_date = accounting_date.replace(day=3, hour=23, minute=59, second=59)
             return adjusted_accounting_date.strftime(date_display_format)
         except Exception as e:
-            print(f"Error calculating accounting date: {e}")
+            logger.error(f"Error calculating accounting date: {e}")
             return "Error calculating date"
 
 def create_table(doc, data, header, col_widths, table_type=None, count=None):
@@ -233,8 +236,8 @@ def create_table(doc, data, header, col_widths, table_type=None, count=None):
     table.setStyle(TableStyle(style))
     return table
 
-def merge_pdfs(temp_pdfs, session_id):
-    """Merge multiple PDFs into a single PDF."""
+def merge_pdfs(temp_pdfs, output_path):
+    """Merge multiple PDFs into a single output file. Returns output path or None."""
     if not temp_pdfs:
         return None
     merger = PdfMerger()
@@ -242,17 +245,11 @@ def merge_pdfs(temp_pdfs, session_id):
         for pdf_path in temp_pdfs:
             if pdf_path and os.path.exists(pdf_path):
                 merger.append(pdf_path)
-        buffer = BytesIO()
-        merger.write(buffer)
+        merger.write(output_path)
         merger.close()
-        buffer.seek(0)
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=merged_roster.pdf"}
-        )
+        return output_path
     except Exception as e:
-        print(f"Error during PDF merge: {e}")
+        logger.error(f"Error during PDF merge: {e}")
         return None
     finally:
         for path in temp_pdfs:
@@ -260,4 +257,4 @@ def merge_pdfs(temp_pdfs, session_id):
                 try:
                     os.remove(path)
                 except Exception as e:
-                    print(f"Warning: could not delete {path}: {e}")
+                    logger.warning(f"Could not delete {path}: {e}")

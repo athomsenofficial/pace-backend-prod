@@ -54,6 +54,31 @@ TIG_MONTHS_REQUIRED = {
 }
 
 # ============================================================================
+# OFFICIAL ELIGIBILITY-CHART CUTOFFS (E5-E9 boards)
+# Direct DOR and TAFMSD cutoffs from the Enlisted Promotion Eligibility Chart,
+# expressed as (month, day, year_offset) relative to the board `year` input.
+# A member is eligible if DOR <= BOARD_DOR_CUTOFF and TAFMSD <= BOARD_TAFMSD_CUTOFF.
+# DOR and TAFMSD have INDEPENDENT anchors per grade, so they cannot be derived
+# from a single shared anchor (which is why board_filter uses these directly).
+# ============================================================================
+
+BOARD_DOR_CUTOFF = {
+    'SRA': (2, 1, 1),    # 1 FEB (year+1)
+    'SSG': (8, 1, -1),   # 1 AUG (year-1)
+    'TSG': (7, 1, -1),   # 1 JUL (year-1)
+    'MSG': (7, 1, -1),   # 1 JUL (year-1)
+    'SMS': (3, 1, -1),   # 1 MAR (year-1)
+}
+
+BOARD_TAFMSD_CUTOFF = {
+    'SRA': (8, 1, -1),   # 1 AUG (year-1)
+    'SSG': (7, 1, -3),   # 1 JUL (year-3)
+    'TSG': (7, 1, -6),   # 1 JUL (year-6)
+    'MSG': (3, 1, -9),   # 1 MAR (year-9)
+    'SMS': (12, 1, -13), # 1 DEC (year-13)
+}
+
+# ============================================================================
 # TIME IN SERVICE (TAFMSD) — years required
 # ============================================================================
 

@@ -184,8 +184,9 @@ class TestTISFailures:
         assert "TIS" in result.reason
 
     def test_sra_insufficient_tis(self, eligible_sra):
+        # 26E5 TAFMSD cutoff is 01-Aug-2024 (chart). TAFMSD after it => insufficient TIS.
         from board_filter import board_filter
-        eligible_sra["tafmsd"] = datetime(2024, 6, 1)  # Only ~1 year TIS
+        eligible_sra["tafmsd"] = datetime(2025, 1, 1)  # after 01-Aug-2024 cutoff
         result = board_filter(**eligible_sra)
         assert result.status == "ineligible"
         assert "TIS" in result.reason
@@ -272,16 +273,19 @@ class TestA1CBTZ:
     """A1C-specific checks including BTZ eligibility."""
 
     def test_a1c_standard_eligible(self):
+        # year=2025 => 26E5 (cutoff 01-Feb-2026, SCOD 31-Mar-2026).
+        # A1C DOR 01-Sep-2023 => standard SrA pin (DOR+28mo) = 01-Jan-2026 <= cutoff
+        # => re-evaluated as a SrA and eligible (5-level PAFSC, enough TIS).
         from board_filter import board_filter
         result = board_filter(
             grade="A1C",
             year=2025,
-            date_of_rank=datetime(2022, 3, 1),   # DOR+28=Jul2024 <= Feb2025 cutoff -> True
+            date_of_rank=datetime(2023, 9, 1),
             uif_code=0,
             uif_disposition_date=None,
-            tafmsd=datetime(2023, 6, 1),          # 3yr TIS=Jun2026 > SCOD Mar2026 -> no exclusion
+            tafmsd=datetime(2023, 9, 1),
             re_status=None,
-            pafsc="3F031",
+            pafsc="3F051",                          # 5-level: meets SrA requirement
             two_afsc=None, three_afsc=None, four_afsc=None,
             member_name="TEST A1C",
             roster_type="mel",
@@ -290,15 +294,34 @@ class TestA1CBTZ:
         assert isinstance(result, EligibilityResult)
         assert result.status == "eligible"
 
+    def test_a1c_projected_sra_low_skill_is_discrepancy(self):
+        # Same standard-eligible A1C but only a 3-level PAFSC: as a projected SrA
+        # it must meet the 5-level requirement => discrepancy (flagged for review).
+        from board_filter import board_filter
+        result = board_filter(
+            grade="A1C", year=2025,
+            date_of_rank=datetime(2023, 9, 1),
+            uif_code=0, uif_disposition_date=None,
+            tafmsd=datetime(2023, 9, 1),
+            re_status=None,
+            pafsc="3F031",                          # 3-level
+            two_afsc=None, three_afsc=None, four_afsc=None,
+            member_name="TEST A1C LOWSKILL", roster_type="mel", logger=None,
+        )
+        assert result.status == "discrepancy"
+        assert "skill level" in result.reason.lower()
+
     def test_a1c_btz_eligible(self):
+        # A1C DOR 01-Jan-2024 => standard pin (DOR+28mo) = 01-May-2026 > SCOD (31-Mar-2026)
+        # but BTZ pin (DOR+22mo) = 01-Nov-2025 <= SCOD => BTZ page.
         from board_filter import board_filter
         result = board_filter(
             grade="A1C",
             year=2025,
-            date_of_rank=datetime(2023, 4, 1),    # DOR+28=Aug2025 > Feb cutoff -> None (BTZ path)
-            uif_code=0,                             # DOR+22=Feb2025 <= Feb2025 cutoff -> BTZ True
+            date_of_rank=datetime(2024, 1, 1),
+            uif_code=0,
             uif_disposition_date=None,
-            tafmsd=datetime(2023, 6, 1),           # 3yr TIS=Jun2026 > SCOD Mar2026 (no exclusion)
+            tafmsd=datetime(2024, 1, 1),
             re_status=None,
             pafsc="3F031",
             two_afsc=None, three_afsc=None, four_afsc=None,

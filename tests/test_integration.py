@@ -1,47 +1,13 @@
 """
-Step 16: Integration test — full upload → preview → download cycle.
+Integration test — full upload → preview → download cycle.
 
 Run: pytest tests/test_integration.py -v
+
+Uses client and sample_csv fixtures from conftest.py.
 """
 import pytest
 import io
 import pandas as pd
-from fastapi.testclient import TestClient
-from main import app
-
-
-@pytest.fixture
-def client():
-    """FastAPI test client."""
-    return TestClient(app)
-
-
-@pytest.fixture
-def sample_csv():
-    """Generate a minimal valid roster CSV for testing."""
-    data = {
-        "FULL_NAME": ["DOE, JOHN A", "SMITH, JANE B", "JONES, BOB C"],
-        "GRADE": ["SSG", "SSG", "SSG"],
-        "ASSIGNED_PAS_CLEARTEXT": ["51 FSS/FSM", "51 FSS/FSM", "51 FSS/FSVS"],
-        "DAFSC": ["3F071", "3F071", "1N071"],
-        "DOR": ["15-Jan-2023", "01-Mar-2023", "01-Jun-2024"],
-        "DATE_ARRIVED_STATION": ["01-Jun-2022", "15-Aug-2021", "01-Mar-2023"],
-        "TAFMSD": ["01-Jun-2018", "01-Jan-2017", "01-Sep-2019"],
-        "REENL_ELIG_STATUS": [None, None, None],
-        "ASSIGNED_PAS": ["FE8GAA", "FE8GAA", "FE8GAB"],
-        "PAFSC": ["3F071", "3F071", "1N071"],
-        "GRADE_PERM_PROJ": [None, None, None],
-        "UIF_CODE": [None, None, None],
-        "UIF_DISPOSITION_DATE": [None, None, None],
-        "2AFSC": [None, None, None],
-        "3AFSC": [None, None, None],
-        "4AFSC": [None, None, None],
-    }
-    df = pd.DataFrame(data)
-    buffer = io.BytesIO()
-    df.to_csv(buffer, index=False)
-    buffer.seek(0)
-    return buffer
 
 
 # ─── Test: Health check ──────────────────────────────────────────────────────
@@ -52,8 +18,8 @@ class TestHealthCheck:
         response = client.get("/api/v1/health")
         assert response.status_code == 200
         body = response.json()
-        assert body["success"] is True
-        assert body["data"]["status"] == "healthy"
+        assert body["status"] == "healthy"
+        assert body["service"] == "pace-backend"
 
     def test_health_legacy_redirect(self, client):
         response = client.get("/api/health", follow_redirects=False)
@@ -76,8 +42,6 @@ class TestUploadPreviewCycle:
         body = response.json()
         assert body["success"] is True
         assert body["session_id"] is not None
-        assert "data" in body
-        assert body["session_id"]
 
     def test_upload_then_preview(self, client, sample_csv):
         """Upload, then fetch preview and verify member data."""
@@ -94,13 +58,12 @@ class TestUploadPreviewCycle:
         preview_resp = client.get(f"/api/v1/roster/preview/{session_id}")
         assert preview_resp.status_code == 200
         body = preview_resp.json()
-        assert body["success"] is True
-        data = body["data"]
-        assert data["cycle"] == "SSG"
-        assert data["year"] == 2025
+        assert body["session_id"] == session_id
+        assert body["cycle"] == "SSG"
+        assert body["year"] == 2025
 
         # Should have processed members into categories
-        stats = data["statistics"]
+        stats = body["statistics"]
         total = stats["eligible"] + stats["ineligible"] + stats["discrepancy"] + stats["btz"]
         assert total > 0, "At least one member should be categorized"
 
@@ -148,8 +111,7 @@ class TestCalculators:
         })
         assert response.status_code == 200
         body = response.json()
-        assert body["success"] is True
-        assert "eligible" in body["data"]
+        assert "eligible" in body
 
     def test_btz_eligibility(self, client):
         response = client.post("/api/v1/calculators/btz-eligibility", json={
@@ -159,7 +121,7 @@ class TestCalculators:
         })
         assert response.status_code == 200
         body = response.json()
-        assert body["success"] is True
+        assert "eligible" in body
 
     def test_invalid_rank(self, client):
         response = client.post("/api/v1/calculators/promotion-eligibility", json={
@@ -168,5 +130,4 @@ class TestCalculators:
             "current_rank": "INVALID",
             "target_year": 2025,
         })
-        # Should return error
         assert response.status_code in [200, 400]

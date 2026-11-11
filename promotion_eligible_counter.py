@@ -195,5 +195,16 @@ def get_promotion_eligibility(total_eligible: int, rank: str = 'SrA') -> Tuple[U
             if start <= total_eligible <= end:
                 return mp, pn
 
+    # Formula-based fallback for counts above the table range
+    if total_eligible > 500:
+        if rank in ('SRA',):
+            pn = round(total_eligible * 0.15)
+            mp = round(total_eligible * 0.10)
+            return mp, pn
+        elif rank in ('SSG', 'TSG'):
+            pn = round(total_eligible * 0.10)
+            mp = round(total_eligible * 0.10)
+            return mp, pn
+
     # If no matching range is found
     return 'NA', 'NA'
