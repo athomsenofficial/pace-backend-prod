@@ -6,6 +6,7 @@ Runs served (one alpha-roster upload per session, see routers/roster_runs.py):
   2. DEROS Option Roster                     (DAFI 36-2110)
   3. RE Code Management Roster               (DAFI 36-2606)
   4. SrA BTZ Quarterly Eligibility Roster    (AFI 36-2502)
+  5. First-Term CJR Window Roster            (DAFI 36-2606 Chapter 3)
 
 Changes when: a governing publication changes. Every regulatory value below was
 checked on 17 Nov 2026 against the editions named in PUB_* (paragraph / table
@@ -36,6 +37,7 @@ RETENTION_FOOTER = (
     "and DAFI 36-2110 (9 Aug 2024, Chg 2)."
 )
 BTZ_FOOTER = "Screening aid only. MPF verifies eligibility and quotas per AFI 36-2502 (2 Jul 2026)."
+CJR_FOOTER = "Screening aid only. MPF and commander determine eligibility per DAFI 36-2606."
 
 # =============================================================================
 # Data conventions of the alpha-roster export (owner, 00-decisions)
@@ -71,21 +73,8 @@ REENLISTMENT_NOTIFY_DAYS_BEFORE_DOS = 150
 # extensions (Stop-Loss, admin/disciplinary hold) do not count (para 6.6.2.1).
 EXTENSION_CAP_MONTHS = 48
 EXTENSION_CAP_CITATION = "DAFI 36-2606 paras 6.2.2 and 6.6.2.1"
-# DAFI 36-2606 Table 3.1 (CJR Eligibility Window): four-year enlistee = first
-# duty day of the month they complete 32 months through the last duty day of
-# the month they complete 43 months; six-year enlistee = months 56-67.
-CJR_WINDOWS_BY_TERM_MONTHS = {48: (32, 43), 72: (56, 67)}
-CJR_WINDOW_CITATION = "DAFI 36-2606 Table 3.1"
-# DAFI 36-2606 para 3.1.1: "All FTA/FTG, regardless of AFSC/SFSC, must have a
-# CJR to reenlist."
-CJR_REQUIRED_CITATION = "DAFI 36-2606 para 3.1.1"
-# DAFI 36-2606 para 3.4.1: CC may not consider members for a CJR if they have a
-# UIF, lost time, or active NJP on the current enlistment.
-UIF_BLOCKS_CJR_CITATION = "DAFI 36-2606 para 3.4.1"
-# RE 1R = "First Term Airmen/Guardians selected for reenlistment under the SRP"
-# (Table 5.2 item 7). PACE uses it as the proxy for "has a CJR" because the
-# MilPDS CJR code ("C", para 3.4.7.2) is not in the alpha-roster export.
-CJR_SELECTED_RE_CODE = "1R"
+# CJR: OWNER DECISION 17 Nov 2026 — the CJR has no bearing on the Run 1
+# reenlistment status. It is screened by its own run (RUN 5 below).
 # Spec 1 extension-history heuristic (fallback ONLY when ETS is blank, first-
 # termers only): months DOE->DOS. 48 = 4-year no extension; 49-71 = 4-year plus
 # (n-48) extended; 72 = 6-year no extension OR 4-year plus 24 (ambiguous);
@@ -131,16 +120,15 @@ HYT_TENURE_CITATION = "DAFI 36-3203 para 3.10"
 # Owner decision (00-decisions): RE 1J ("Eligible to reenlist but elects
 # separation", Table 5.2 item 2) -> REVIEW, not ELIGIBLE.
 REVIEW_RE_CODES = {"1J": "member elected separation — confirm intent"}
-# 1M = second-term/career member not yet considered under the SRP (Table 5.2
-# item 4) -> "ELIGIBLE - NOT YET SRP CONSIDERED".
-NOT_YET_SRP_CONSIDERED_RE_CODES = ("1M",)
-# 3B (needs SRP consideration/reconsideration) and 3C (first-termer not yet
-# considered under the SRP) are "do not separate" codes awaiting a commander's
-# SRP decision (Table 5.4 items 5-6; CCs must consider within 30 days, para
-# 6.6.5) -> REVIEW.
-SRP_PENDING_RE_CODES = {
-    "3B": "SRP consideration/reconsideration pending — do not separate (CC acts within 30 days, para 6.6.5)",
-    "3C": "first-termer not yet SRP considered — do not separate",
+# "ELIGIBLE - NOT YET SRP CONSIDERED":
+#   1M = second-term/career member not yet considered under the SRP (Table 5.2 item 4);
+#   3B = needs SRP consideration/reconsideration, 3C = first-termer not yet SRP
+#   considered (Table 5.4 items 5-6, "do not separate"). OWNER DECISION 17 Nov
+#   2026: 3B and 3C are treated as eligible, awaiting SRP consideration.
+NOT_YET_SRP_CONSIDERED_RE_CODES = ("1M", "3B", "3C")
+OWNER_ELIGIBLE_RE_CODES = {
+    "3B": "ELIGIBLE (owner decision 17 Nov 2026: awaiting SRP consideration)",
+    "3C": "ELIGIBLE (owner decision 17 Nov 2026: awaiting SRP consideration)",
 }
 
 # Run 1 statuses, most decisive first (used to pick the status when a member
@@ -289,10 +277,12 @@ def _build_re_map() -> dict:
         citation = f"DAFI 36-2606 Table {_SERIES_TABLE[series]} item {item}"
         if code in RE_4_SERIES_WAIVERS:
             citation += f"; {RE_WAIVER_CITATION}"
+        if code in OWNER_ELIGIBLE_RE_CODES:
+            waivable, authority = None, "N/A (owner: eligible, awaiting SRP consideration)"
         out[code] = {
             "series": series,
             "definition": definition,
-            "eligibility_class": _SERIES_CLASS[series],
+            "eligibility_class": OWNER_ELIGIBLE_RE_CODES.get(code, _SERIES_CLASS[series]),
             "waivable": waivable,
             "waiver_authority": authority,
             "citation": citation,
@@ -339,6 +329,43 @@ DEROS_FLAG_INSUFFICIENT_RETAINABILITY = "INSUFFICIENT_RETAINABILITY"
 RE_REVIEW_PREFIXES = ("2", "4")
 
 # =============================================================================
+# RUN 5 — First-Term CJR Window (DAFI 36-2606 Chapter 3)
+# =============================================================================
+# Table 3.1 (CJR Eligibility Window): four-year enlistee = first duty day of the
+# month they complete 32 months through the last duty day of the month they
+# complete 43 months; six-year enlistee = months 56-67.
+CJR_WINDOWS_BY_TERM_MONTHS = {48: (32, 43), 72: (56, 67)}
+CJR_WINDOW_CITATION = "DAFI 36-2606 Table 3.1"
+# Para 3.1.1: "All FTA/FTG, regardless of AFSC/SFSC, must have a CJR to reenlist."
+CJR_REQUIRED_CITATION = "DAFI 36-2606 para 3.1.1"
+# Para 3.1.2: no CJR in the window (constrained AFSC) = no CJR later; separate at DOS.
+CJR_MISSED_CITATION = "DAFI 36-2606 para 3.1.2"
+# Para 3.4.1: CC may not consider members for a CJR if they have a UIF, lost
+# time, or active NJP on the current enlistment (shown for information).
+UIF_BLOCKS_CJR_CITATION = "DAFI 36-2606 para 3.4.1"
+# RE 1R = "First Term Airmen/Guardians selected for reenlistment under the SRP"
+# (Table 5.2 item 7). Members in 1R are left off the CJR run (owner spec); the
+# MilPDS CJR code ("C", para 3.4.7.2) is not in the alpha-roster export.
+CJR_SELECTED_RE_CODE = "1R"
+# "APPROACHING" = window opens within this many months. Local preference (param).
+CJR_APPROACHING_MONTHS = 3
+CJR_STATUS_IN_WINDOW = "IN WINDOW"
+CJR_STATUS_PAST_WINDOW = "PAST WINDOW"
+CJR_STATUS_APPROACHING = "APPROACHING"
+CJR_NOTES = (
+    "First term = DOE equals TAFMSD (no prior service, never reenlisted). Term from ETS minus DOE: 48 months = "
+    "4-year; 49-71 = 4-year with effective extensions; 72 or more = ambiguous (6-year, or 4-year extended) — both "
+    "windows are checked.",
+    "CJR window (DAFI 36-2606 Table 3.1): from the first day of the month the member completes 32 months (56 for a "
+    "6-year enlistee) through the last day of the month they complete 43 months (67).",
+    "A CJR is required to reenlist (para 3.1.1); members are only eligible for a CJR during their window (Table 3.1 "
+    "Note 3); in a constrained AFSC, no CJR in the window means no CJR later (para 3.1.2).",
+    "UIF shown for information: a UIF, lost time or active NJP bars CJR consideration (para 3.4.1).",
+    "Members in RE 1R (first-termer selected under the SRP) are not listed. The MilPDS CJR code is not in the "
+    "export — verify CJR status in MilPDS.",
+)
+
+# =============================================================================
 # RUN 4 — SrA BTZ Quarterly Eligibility — AFI 36-2502 (2 Jul 2026)
 # =============================================================================
 # Para 2.2.1: SrA after "36 months' time-in-service and 20 months' time-in-grade
@@ -363,19 +390,23 @@ BTZ_PROCESSING_OFFSETS_MONTHS = (-3, -2)
 BTZ_BOARD_OFFSET_MONTHS = -1
 BTZ_QUARTER_CITATION = "AFI 36-2502 (2 Jul 2026) Table 2.7"
 # Quotas — paras 2.3.5-2.3.7: 15 percent of TIG/TIS eligibles; large unit =
-# seven or more eligible. The publication does not say how to round 15 percent;
-# PACE rounds half-up (owner spec).
+# seven or more eligible. OWNER DECISION 17 Nov 2026: no rounding — PACE shows
+# the exact 15% value (two decimals); the MPF sets the whole-number quota.
 BTZ_QUOTA_RATE_PERCENT = 15
+BTZ_QUOTA_DECIMALS = 2
 BTZ_LARGE_UNIT_THRESHOLD = 7          # 7 or more eligibles = LARGE unit (own quota)
 BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA = 2    # para 2.3.5.3: no large units and 2-6 small-unit eligibles = one quota
 BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA = 6
 BTZ_QUOTA_CITATION = "AFI 36-2502 (2 Jul 2026) paras 2.3.5-2.3.7"
-BTZ_ROUNDING_NOTE = "15% is rounded half-up (PACE rule; AFI 36-2502 does not state a rounding method)."
+BTZ_ROUNDING_NOTE = "AFI 36-2502 sets no rounding rule; the MPF determines the whole-number quota."
 BTZ_SINGLE_ELIGIBLE_NOTE = ("Only 1 eligible base-wide: the MPF commander decides whether a board is held and may "
                             "authorize one quota (AFI 36-2502 para 2.3.5.4).")
-BTZ_COMBINE_WITH_LARGE_NOTE = ("Small-unit pool is too small for one quota at 15% while a large unit exists: the "
-                               "large unit and small units combine to meet at the central base board (AFI 36-2502 "
-                               "para 2.3.5.2). MPF confirms the combined quota under the written board procedures.")
+# OWNER DECISION 17 Nov 2026: the CBB quota is always 15% of the total pooled
+# small-unit eligibles (units under 7 always pool). Para 2.3.5.2 (a large unit
+# may combine with the small units at the CBB) is cited for information only.
+BTZ_COMBINE_WITH_LARGE_NOTE = ("AFI 36-2502 para 2.3.5.2 allows a large unit to combine with the small units at the "
+                               "central base board when the small units cannot make one quota; PACE shows 15% of "
+                               "the pooled small-unit eligibles (owner decision).")
 # CBB participation: para 2.4.2.1, restated by AFPC on myFSS (emailed to the
 # owner 17 Nov 2026).
 BTZ_CBB_POLICY_NOTE = (
@@ -441,19 +472,14 @@ RULE_REFERENCES = [
     ("dos-reenlistment", "4-series waivers", "4F, 4K, 4N: CC/civilian director (4K in an SRB AFSC: AF/A1 or SF/S1); "
      "4E: group CC extension via AFPC/DPPSA (first-termers); 4G: RI 9A000-9A300 retrainees only",
      f"{PUB_REENLISTMENT} Table 5.6", VERIFIED),
-    ("dos-reenlistment", "RE 3B / 3C", "REVIEW (SRP consideration pending — do not separate)",
-     f"{PUB_REENLISTMENT} Table 5.4 items 5-6; para 6.6.5", VERIFIED),
+    ("dos-reenlistment", "RE 3B / 3C", "ELIGIBLE - NOT YET SRP CONSIDERED (awaiting SRP consideration)",
+     f"{PUB_REENLISTMENT} Table 5.4 items 5-6 (\"do not separate\")", "OWNER DECISION 17 Nov 2026."),
     ("dos-reenlistment", "RE 1J", "REVIEW (member elected separation — confirm intent)",
      "Owner decision 2026-11-17; DAFI 36-2606 Table 5.2 item 2 (eligible, elects separation)", "Owner decision."),
-    ("dos-reenlistment", "UIF", "Any UIF code = REVIEW; UIF blocks CJR for first-termers",
-     f"{PUB_REENLISTMENT} para 3.4.1; {PUB_ADVERSE_ACTIONS} Table 3.2", VERIFIED),
-    ("dos-reenlistment", "CJR required (first term)", "CJR required to reenlist",
-     f"{PUB_REENLISTMENT} para 3.1.1", VERIFIED),
-    ("dos-reenlistment", "CJR window", "Months 32-43 (4-year) / 56-67 (6-year) of enlistment",
-     f"{PUB_REENLISTMENT} Table 3.1", VERIFIED),
-    ("dos-reenlistment", "CJR proxy", f"RE {CJR_SELECTED_RE_CODE} (SRP-selected) treated as holding a CJR",
-     "DAFI 36-2606 Table 5.2 item 7; CJR code 'C' (para 3.4.7.2) is not in the export",
-     "PACE approximation; owner to confirm."),
+    ("dos-reenlistment", "UIF", "Any UIF code = REVIEW", f"Owner spec; {PUB_ADVERSE_ACTIONS} Table 3.2 (UIF codes)",
+     VERIFIED),
+    ("dos-reenlistment", "CJR", "No effect on the reenlistment status (see the CJR Window run)", "Owner",
+     "OWNER DECISION 17 Nov 2026."),
     ("dos-reenlistment", "Extension cap", f"{EXTENSION_CAP_MONTHS} months per enlistment (voluntary; cannot be waived)",
      f"{PUB_REENLISTMENT} paras 6.2.2, 6.6.2.1", VERIFIED),
     ("dos-reenlistment", "Extension reasons", "Table 6.2 reason (Rules 12, 13, 14; Rule 28c personal convenience); "
@@ -462,7 +488,7 @@ RULE_REFERENCES = [
      f"{PUB_REENLISTMENT} paras 5.11.11, 6.6.9", VERIFIED),
     ("dos-reenlistment", "HYT tenure", "E-4 10, E-5 20, E-6 22, E-7 24, E-8 26, E-9 30 years TAFMS",
      f"{PUB_RETIREMENTS} para 3.10", VERIFIED + " E-1 to E-3 values and the MEL's temporary HYT-extension window "
-     "are not in the provided publications — owner to confirm."),
+     "are not in the provided publications — OWNER: keep (17 Nov 2026)."),
     ("deros-option", "DEROS window", f"{DEROS_WINDOW_MONTHS} months", "Owner spec (DEROS_WINDOW_MONTHS)", LOCAL_PREFERENCE),
     ("deros-option", "OS-to-CONUS retainability", f"{OS_TO_CONUS_RETAINABILITY_MONTHS} months from the DEROS month",
      f"{PUB_ASSIGNMENTS} Table 6.4 Rules 10-11; para 6.28.2", VERIFIED),
@@ -470,6 +496,18 @@ RULE_REFERENCES = [
      "extended to DOS", f"{PUB_ASSIGNMENTS} para 6.28.4.3", VERIFIED),
     ("deros-option", "Indefinite DEROS retainability", f"{INDEFINITE_DEROS_RETAINABILITY_MONTHS} months",
      f"{PUB_ASSIGNMENTS} paras 6.28.4.7, 7.5.5.1.3", VERIFIED),
+    ("cjr-window", "CJR required (first term)", "CJR required to reenlist", f"{PUB_REENLISTMENT} para 3.1.1",
+     VERIFIED),
+    ("cjr-window", "CJR window", "Months 32-43 (4-year) / 56-67 (6-year) of enlistment, calendar months",
+     f"{PUB_REENLISTMENT} Table 3.1", VERIFIED),
+    ("cjr-window", "Only in window", "No CJR outside the window; constrained AFSC: none later",
+     f"{PUB_REENLISTMENT} Table 3.1 Note 3; para 3.1.2", VERIFIED),
+    ("cjr-window", "UIF", "Shown for information (bars CJR consideration)", f"{PUB_REENLISTMENT} para 3.4.1",
+     VERIFIED),
+    ("cjr-window", "RE 1R excluded", f"RE {CJR_SELECTED_RE_CODE} (first-termer selected under the SRP) not listed",
+     f"{PUB_REENLISTMENT} Table 5.2 item 7", "Owner spec; CJR code not in the export."),
+    ("cjr-window", "Approaching", f"Window opens within {CJR_APPROACHING_MONTHS} months", "Owner spec",
+     LOCAL_PREFERENCE),
     ("re-code-review", "RE review prefixes", ", ".join(RE_REVIEW_PREFIXES), "Owner spec (RE_REVIEW_PREFIXES)",
      LOCAL_PREFERENCE),
     ("btz-quarterly", "Fully qualified SrA date",
@@ -481,10 +519,13 @@ RULE_REFERENCES = [
      "Jan-Mar: Oct/Nov, Dec", BTZ_QUARTER_CITATION, VERIFIED),
     ("btz-quarterly", "Quota", f"{BTZ_QUOTA_RATE_PERCENT}%; LARGE unit = {BTZ_LARGE_UNIT_THRESHOLD}+ eligibles; "
      "smaller units pooled into CBB", BTZ_QUOTA_CITATION, VERIFIED),
-    ("btz-quarterly", "Quota rounding", "Half-up", "Owner spec", NOT_IN_PUBLICATION),
+    ("btz-quarterly", "Quota rounding", "None: exact 15% shown to two decimals; MPF sets the whole number",
+     "AFI 36-2502 sets no rounding rule", "OWNER DECISION 17 Nov 2026."),
+    ("btz-quarterly", "CBB quota", "15% of the total pooled small-unit eligibles (units under 7 always pool)",
+     "AFI 36-2502 (2 Jul 2026) paras 2.3.5, 2.3.7 (para 2.3.5.2 combining noted only)",
+     "OWNER DECISION 17 Nov 2026."),
     ("btz-quarterly", "CBB edge rules", "No large units and 2-6 pooled eligibles = 1 CBB quota; 1 eligible base-wide "
-     "= MPF commander decides; large unit present but pool too small for 1 quota = combine at CBB",
-     "AFI 36-2502 (2 Jul 2026) paras 2.3.5.2-2.3.5.4", VERIFIED),
+     "= MPF commander decides", "AFI 36-2502 (2 Jul 2026) paras 2.3.5.3-2.3.5.4", VERIFIED),
     ("btz-quarterly", "CBB participation", "Units with fewer than 7 eligibles nominate to the CBB; host wing CC sets "
      "CBB guidance", "AFI 36-2502 para 2.4.2.1; AFPC myFSS clarification 17 Nov 2026", VERIFIED),
     ("btz-quarterly", "Previously considered", "GSR 5Q excluded", "AFI 36-2502 (2 Jul 2026) para 2.3.4", VERIFIED),

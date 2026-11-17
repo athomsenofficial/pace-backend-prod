@@ -11,12 +11,13 @@ from datetime import date
 from typing import Any, Callable, Iterable
 
 from config.retention import (
-    CSS_DUTIES, CSS_PSDG, DEROS_WINDOW_MONTHS, DOS_WINDOW_MONTHS, OS_TO_CONUS_RETAINABILITY_CITATION,
+    CJR_APPROACHING_MONTHS, CSS_DUTIES, CSS_PSDG, DEROS_WINDOW_MONTHS, DOS_WINDOW_MONTHS, OS_TO_CONUS_RETAINABILITY_CITATION,
     OS_TO_CONUS_RETAINABILITY_MONTHS, RE_REVIEW_PREFIXES, RULE_REFERENCES,
 )
 from roster_rules import to_int
 
 from .btz import default_quarter, parse_quarter, quarter_id, quarter_info, quarter_options, run_btz_quarterly
+from .cjr import run_cjr_window
 from .common import RunResult, build_members
 from .retention import run_deros_option, run_dos_reenlistment, run_re_code_review
 
@@ -117,7 +118,7 @@ _register(RunDef(
     label="DOS / Reenlistment Decision",
     description=(
         "Enlisted members whose DOS is within the window: months remaining, action-by date (DOS minus 120 days), "
-        "reenlistment status with every reason (RE code, UIF, CJR, extension history, HYT). DOS already past, "
+        "reenlistment status with every reason (RE code, UIF, extension history, HYT). DOS already past, "
         "indefinite DOS and data issues are listed separately. Officers excluded."
     ),
     duty=(CSS_DUTIES["F1-3"], CSS_DUTIES["F1-36"], CSS_DUTIES["G1-1"]),
@@ -188,6 +189,25 @@ _register(RunDef(
                      "board Mar). Default: the cycle whose first processing month is the current or next month.",
                      "AFI 36-2502 (2 Jul 2026) Table 2.7"),),
     compute=run_btz_quarterly,
+))
+
+
+_register(RunDef(
+    id="cjr-window",
+    label="First-Term CJR Window",
+    description=(
+        "Enlisted first-termers (DOE equals TAFMSD) in or past their Career Job Reservation window (DAFI 36-2606 "
+        "Table 3.1: months 32-43 of a 4-year, 56-67 of a 6-year enlistment), or whose window opens soon, who are "
+        "not in RE 1R. Window dates, months until it closes, RE code and UIF. Sorted by window close. "
+        "Officers excluded."
+    ),
+    duty=(CSS_DUTIES["F1-36"], CSS_DUTIES["F1-3"]),
+    required_columns=("FULL_NAME", "GRADE", "DOE", "TAFMSD", "ETS", "DOS"),
+    optional_columns=("DAFSC", "REENL_ELIG_STATUS", "UIF_CODE", "UIF_DISPOSITION_DATE", *_COMMON_OPTIONAL),
+    params=(RunParam("approaching_months", "Approaching horizon", "int", CJR_APPROACHING_MONTHS, "months",
+                     "Also list first-termers whose CJR window opens within this many months (0 = none).",
+                     "Owner spec (CJR_APPROACHING_MONTHS) — local preference", 0, 12),),
+    compute=run_cjr_window,
 ))
 
 

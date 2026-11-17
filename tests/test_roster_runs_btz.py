@@ -118,9 +118,10 @@ class TestQuarters:
 
 
 class TestQuotas:
-    @pytest.mark.parametrize("n,q", [(7, 1), (9, 1), (10, 2), (16, 2), (17, 3), (23, 3), (24, 4), (29, 4),
-                                     (30, 5), (36, 5)])
-    def test_rounding_half_up(self, n, q):
+    # Owner decision 17 Nov 2026: no rounding — exact 15%, two decimals; the MPF sets the whole number.
+    @pytest.mark.parametrize("n,q", [(1, 0.15), (2, 0.30), (7, 1.05), (9, 1.35), (10, 1.50), (11, 1.65),
+                                     (16, 2.40), (17, 2.55), (23, 3.45), (36, 5.40)])
+    def test_exact_15_percent_no_rounding(self, n, q):
         assert quota_for(n) == q
 
     def test_unit_of_exactly_6_and_7(self):
@@ -129,35 +130,42 @@ class TestQuotas:
         r = run(rows)
         units = {u["pascode"]: u for u in r.extra["units"]}
         assert units["ZZ6TEST"]["size"] == "SMALL" and units["ZZ6TEST"]["quota"] is None
-        assert units["ZZ7TEST"]["size"] == "LARGE" and units["ZZ7TEST"]["quota"] == 1
+        assert units["ZZ7TEST"]["size"] == "LARGE" and units["ZZ7TEST"]["quota"] == 1.05
+        assert units["ZZ7TEST"]["quota_display"] == "1.05"
         assert r.extra["cbb"]["pool_total"] == 6
-        assert r.extra["cbb"]["quota"] == 1  # 15% of 6 = 0.9 -> 1
-        assert r.summary["total_quota"] == 2
+        assert r.extra["cbb"]["quota"] == 0.90 and r.extra["cbb"]["quota_display"] == "0.90"  # 15% of pooled 6
+        assert r.summary["total_quota"] == 1.95
+        assert "the MPF determines the whole-number quota" in r.extra["cbb"]["note"]
 
-    @pytest.mark.parametrize("n,q", [(9, 1), (10, 2), (16, 2), (17, 3)])
+    @pytest.mark.parametrize("n,q", [(9, 1.35), (10, 1.50), (16, 2.40), (17, 2.55)])
     def test_large_unit_quota_via_run(self, n, q):
         r = run([in_q2(f"TESTBIG, B{i:02d}", "ZZBTEST") for i in range(n)])
         assert r.extra["units"][0]["quota"] == q
+        assert r.extra["units"][0]["quota_display"] == f"{q:.2f}"
 
-    def test_no_large_unit_base_gets_one_cbb_quota(self):
-        units, cbb = compute_quotas({"ZZATEST": 1, "ZZBTEST": 1}, {}, False)
-        assert cbb["pool_total"] == 2 and cbb["quota"] == 1  # 0.3 would round to 0; edge rule gives 1
+    @pytest.mark.parametrize("pool", [2, 3, 4, 5, 6])
+    def test_no_large_unit_2_to_6_gets_one_cbb_quota(self, pool):
+        units, cbb = compute_quotas({"ZZATEST": pool - 1, "ZZBTEST": 1}, {}, False)
+        assert cbb["pool_total"] == pool and cbb["quota"] == 1.0 and "para 2.3.5.3" in cbb["note"]
+
+    def test_no_large_unit_via_run(self):
         rows = [in_q2("TESTPOOL, A1", "ZZATEST"), in_q2("TESTPOOL, A2", "ZZATEST"),
                 in_q2("TESTPOOL, B1", "ZZBTEST")]
         r = run(rows)
-        assert r.extra["cbb"]["quota"] == 1 and "No large units" in r.extra["cbb"]["note"]
+        assert r.extra["cbb"]["quota"] == 1.0 and "No large units" in r.extra["cbb"]["note"]
 
-    def test_small_pool_too_small_with_large_unit_combines_at_cbb(self):
-        # AFI 36-2502 para 2.3.5.2: a large unit exists and the small units cannot make one quota at 15%
-        # -> the large unit and small units combine to meet at the central base board.
+    def test_cbb_is_15_percent_of_pooled_total_even_with_large_units(self):
+        # Owner decision: CBB quota = 15% of all pooled small-unit eligibles; no combining computation.
         units, cbb = compute_quotas({"ZZLTEST": 10, "ZZSTEST": 2}, {}, False)
-        assert cbb["quota"] is None and cbb["combine_with_large_unit"] is True
-        assert "para 2.3.5.2" in cbb["note"]
-        assert "para 2.3.5.2" in units[0]["quota_note"] and units[0]["quota"] == 2
+        assert cbb["quota"] == 0.30 and "combine_with_large_unit" not in cbb
+        assert "para 2.3.5.2" in cbb["note"]  # cited for information only
+        assert units[0]["quota"] == 1.50 and units[0]["quota_note"] == "Own quota"
+        units, cbb = compute_quotas({"ZZLTEST": 10, "ZZSTEST": 4, "ZZTTEST": 6, "ZZUTEST": 3}, {}, False)
+        assert cbb["pool_total"] == 13 and cbb["quota"] == 1.95
 
-    def test_small_pool_with_large_unit_that_makes_a_quota(self):
-        units, cbb = compute_quotas({"ZZLTEST": 10, "ZZSTEST": 4}, {}, False)
-        assert cbb["quota"] == 1 and cbb["combine_with_large_unit"] is False  # 0.6 -> 1
+    def test_no_large_unit_pool_over_6(self):
+        units, cbb = compute_quotas({"ZZATEST": 6, "ZZBTEST": 5}, {}, False)
+        assert cbb["pool_total"] == 11 and cbb["quota"] == 1.65
 
     def test_cbb_policy_note_cited(self):
         r = run([in_q2("TESTPOLICY, PO")])
@@ -356,10 +364,24 @@ class TestPublicationAlignment:
         assert BTZ_FOOTER.endswith("per AFI 36-2502 (2 Jul 2026).")
         btz = [r for r in RULE_REFERENCES if r[0] == "btz-quarterly"]
         assert btz and all("DAFI 36-2502" not in r[3] for r in btz)
-        assert any(r[1] == "Quota rounding" and "Not stated in the publication" in r[4] for r in btz)
+        assert any(r[1] == "Quota rounding" and "OWNER DECISION" in r[4] for r in btz)
 
     def test_pdf_summary_prints_cbb_policy(self):
         r = run([in_q2("TESTPDFPOL, PP", "ZZATEST"), in_q2("TESTPDFPOL, PQ", "ZZBTEST")])
         doc = fitz.open(stream=build_pdf(r), filetype="pdf")
         text = doc[0].get_text().replace("\n", " ")
         assert "Policy:" in text and "2.4.2.1" in text
+
+
+class TestExactQuotaExports:
+    def test_pdf_and_xlsx_show_two_decimals(self):
+        rows = [in_q2(f"TESTBIG, B{i:02d}", "ZZBTEST") for i in range(11)]
+        rows += [in_q2("TESTSMALL, S1", "ZZSTEST"), in_q2("TESTSMALL, S2", "ZZSTEST")]
+        r = run(rows)
+        text = fitz.open(stream=build_pdf(r), filetype="pdf")[0].get_text().replace("\n", " ")
+        assert "1.65" in text and "0.30" in text and "1.95" in text
+        assert "sets no rounding rule" in text
+        ws = load_workbook(io.BytesIO(build_xlsx(r)))["MPF Summary"]
+        quotas = {row[0].value: row[4] for row in ws.iter_rows(min_row=2) if row[0].value}
+        assert quotas["ZZBTEST"].value == 1.65 and quotas["ZZBTEST"].number_format == "0.00"
+        assert quotas["CBB POOL"].value == 0.3 and quotas["TOTAL"].value == 1.95

@@ -79,3 +79,23 @@ unless ETS-DOE is exactly 48 or 72 (still ambiguous at 72).
 - Table F1 item 40: Manage unit Vulnerable to Move List (VML) — DAFI 36-2110.
 - Table G1 item 1 (Section Commander): Reenlistments — DAF Forms 901, 1411, 418, 1411-1 SRP Roster — DAFI 36-2606.
 - Table G1 items 6-7: PDD / RNLTD change requests — DAFI 36-2110.
+
+## Owner decisions, 17 Nov 2026 (after the regulation verification, 03-regulation-verification.md)
+1. RE 3B and 3C are ELIGIBLE. Run 1 status = "ELIGIBLE - NOT YET SRP CONSIDERED" (awaiting SRP
+   consideration); RE map class "ELIGIBLE (owner decision ...)". "RE 3B cannot extend"
+   (DAFI 36-2606 para 6.6.5) stays. Run 3 (prefixes 2/4) unaffected.
+2. CJR has NO bearing on the reenlistment status. Run 1 has no CJR reason, column or status
+   effect (no REVIEW for first-termers in/past the window without 1R; no "UIF blocks a CJR"
+   reason). New separate run `cjr-window` (First-Term CJR Window Roster): enlisted
+   first-termers (DOE == TAFMSD), not RE 1R, inside / past / approaching (default 3 months,
+   param `approaching_months`) the DAFI 36-2606 Table 3.1 window (32-43 / 56-67 months;
+   ETS-DOE 72+ checks both). UIF shown for information (para 3.4.1).
+3. BTZ quota: NO rounding. Report the exact 15% value (two decimals) per large unit and for
+   the CBB, with "AFI 36-2502 sets no rounding rule; the MPF determines the whole-number
+   quota." Edge rules kept: no large units and 2-6 pooled eligibles = 1 quota (para
+   2.3.5.3); 1 eligible base-wide = MPF commander decides (para 2.3.5.4).
+4. CBB quota = 15% of the TOTAL pooled small-unit eligibles; units under 7 always pool. No
+   "combine with a large unit" computation (para 2.3.5.2 cited for information only).
+5. MEL: keep the temporary HYT extension window and the E1-E3 HYT values; the MEL's
+   DOR+22 BTZ projection is correct for the MEL (separate process); do not touch the
+   AMN/A1C TIG/TIS values. No MEL code changes.

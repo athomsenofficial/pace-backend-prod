@@ -118,7 +118,7 @@ class TestRun1Extensions:
         _, row = where(r, "TESTDELTA, DAN")
         assert row["term"].startswith("AMBIGUOUS")
         assert row["extension_remaining"] == "24-48"
-        assert "4-year" in row["cjr"] and "6-year" in row["cjr"]
+        assert "cjr" not in row  # CJR has its own run (owner decision 17 Nov 2026)
 
     def test_fallback_heuristic_when_ets_blank(self):
         rows = [
@@ -151,7 +151,6 @@ class TestRun1Extensions:
         assert row["extension_history"] == "Extension history unknown, verify in MilPDS"
         assert row["pending_extension_months"] == 3
         assert row["extension_remaining"] == "<= 45 (verify)"
-        assert row["cjr"] == "N/A (not first term)"
 
     def test_dos_before_ets_is_review(self):
         r = run("dos-reenlistment", [careerist("TESTJULIET, JO", "31-MAY-2027", ets="31-AUG-2027")])
@@ -160,53 +159,30 @@ class TestRun1Extensions:
         assert any("DOS is earlier than ETS" in x for x in row["reasons"])
 
 
-class TestRun1Cjr:
-    def test_first_termer_past_cjr_window_without_1r_flagged(self):
+class TestRun1NoCjr:
+    """Owner decision 17 Nov 2026: the CJR has no bearing on the reenlistment status."""
+
+    def test_first_termer_past_cjr_window_without_1r_not_flagged(self):
         r = run("dos-reenlistment", [first_termer("TESTKILO, KAY", "01-JAN-2023", "31-DEC-2026", re="1M")])
         _, row = where(r, "TESTKILO, KAY")
-        assert row["month_of_enlistment"] == 47
-        assert "past window" in row["cjr"]
-        assert row["status"] == STATUS_REVIEW
-        assert any("CJR required to reenlist (DAFI 36-2606 para 3.1.1)" in x for x in row["reasons"])
-
-    def test_first_termer_with_1r_not_flagged(self):
-        r = run("dos-reenlistment", [first_termer("TESTLIMA, LEO", "01-JAN-2023", "31-DEC-2026", re="1R")])
-        _, row = where(r, "TESTLIMA, LEO")
-        assert row["status"] == STATUS_ELIGIBLE
+        assert row["status"] == STATUS_ELIGIBLE_NYSC
         assert not any("CJR" in x for x in row["reasons"])
+        assert "cjr" not in row and "month_of_enlistment" not in row
 
-    def test_first_termer_in_window(self):
-        # 6-year first-termer, month 64 of 72 -> 6-year window 56-67 (DAFI 36-2606 Table 3.1; ambiguous 72
-        # checks both). RE 3C = not yet SRP considered -> REVIEW.
-        r = run("dos-reenlistment", [first_termer("TESTMIKE, MO", "01-AUG-2021", "31-JUL-2027", re="3C")])
-        _, row = where(r, "TESTMIKE, MO")
-        assert "6-year: in window (56-67)" in row["cjr"]
-        assert row["status"] == STATUS_REVIEW
-        assert any("first-termer not yet SRP considered" in x for x in row["reasons"])
-
-    @pytest.mark.parametrize("doe,month_no,where_text", [
-        # as_of 17-NOV-2026. Table 3.1: 4-year window = months 32-43.
-        ("01-MAY-2024", 31, "before window"),
-        ("01-APR-2024", 32, "in window"),
-        ("01-JAN-2024", 35, "in window"),
-        ("01-MAY-2023", 43, "in window"),
-        ("01-APR-2023", 44, "past window"),
-    ])
-    def test_four_year_cjr_window_is_months_32_to_43(self, doe, month_no, where_text):
+    @pytest.mark.parametrize("doe", ["01-MAY-2024", "01-APR-2024", "01-MAY-2023", "01-APR-2023"])
+    def test_window_position_never_changes_status(self, doe):
         d, mon, y = doe.split("-")
         ets = date(int(y) + 4, ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV",
                                 "DEC"].index(mon) + 1, 1) - timedelta(days=1)
-        ets_s = ets.strftime("%d-%b-%Y").upper()
-        r = run("dos-reenlistment", [first_termer("TESTWINDOW, WIN", doe, ets_s, re="1M")],
-                {"dos_window_months": 60})
+        r = run("dos-reenlistment", [first_termer("TESTWINDOW, WIN", doe, ets.strftime("%d-%b-%Y").upper(),
+                                                  re="1P")], {"dos_window_months": 60})
         _, row = where(r, "TESTWINDOW, WIN")
-        assert row["month_of_enlistment"] == month_no
-        assert f"4-year: {where_text} (32-43)" in row["cjr"]
-        flagged = any("CJR required to reenlist" in x for x in row["reasons"])
-        assert flagged == (where_text != "before window")
+        assert row["status"] == STATUS_ELIGIBLE and not any("CJR" in x for x in row["reasons"])
 
-    def test_cjr_windows_match_table_3_1(self):
-        assert CJR_WINDOWS_BY_TERM_MONTHS == {48: (32, 43), 72: (56, 67)}
+    def test_run1_columns_and_notes_have_no_cjr(self):
+        r = run("dos-reenlistment", [careerist("TESTCOLS, CO", "15-JUN-2027")])
+        assert all(c.key != "cjr" for c in r.columns)
+        assert not any("CJR window" in n for n in r.notes)
 
 
 class TestRun1ReCodes:
@@ -226,9 +202,9 @@ class TestRun1ReCodes:
         ("3A", STATUS_INELIGIBLE),
         ("3D", STATUS_INELIGIBLE),
         ("3I", STATUS_INELIGIBLE),
-        # 3B / 3C: do-not-separate codes awaiting SRP consideration.
-        ("3B", STATUS_REVIEW),
-        ("3C", STATUS_REVIEW),
+        # 3B / 3C: owner decision 17 Nov 2026 — eligible, awaiting SRP consideration.
+        ("3B", STATUS_ELIGIBLE_NYSC),
+        ("3C", STATUS_ELIGIBLE_NYSC),
         ("4D", STATUS_INELIGIBLE),
         ("4G", STATUS_INELIGIBLE),  # waivable only for RI 9A000-9A300 retrainees
         ("4I", STATUS_INELIGIBLE),
@@ -276,6 +252,16 @@ class TestRun1ReCodes:
         r = run("dos-reenlistment", [careerist("TESTSIERRA, SUE", "15-JUN-2027", re="3B")])
         note = where(r, "TESTSIERRA, SUE")[1]["extension_note"]
         assert note.startswith("RE 3B: cannot extend") and "para 6.6.5" in note
+
+    def test_3b_3c_eligible_class(self):
+        for code in ("3B", "3C"):
+            info = REENLISTMENT_RE_CODES[code]
+            assert info["eligibility_class"].startswith("ELIGIBLE") and "owner decision" in info["eligibility_class"]
+            assert info["waivable"] is None
+        r = run("dos-reenlistment", [first_termer("TESTTHREEC, TC", "01-AUG-2021", "31-JUL-2027", re="3C")])
+        _, row = where(r, "TESTTHREEC, TC")
+        assert row["status"] == STATUS_ELIGIBLE_NYSC
+        assert "Rule 12" in row["extension_note"]  # 3C may extend (DAFI 36-2606 para 6.6.5.2)
 
     def test_2v_cannot_extend(self):
         r = run("dos-reenlistment", [careerist("TESTVEE, VEE", "15-JUN-2027", re="2V")])
@@ -338,11 +324,12 @@ class TestRun1HytUif:
         assert row["uif_vs_dos"] == "on/after DOS"
         assert row["status"] == STATUS_REVIEW
 
-    def test_uif_blocks_cjr_first_termer(self):
+    def test_uif_has_no_cjr_effect_in_run1(self):
         r = run("dos-reenlistment", [first_termer("TESTWHISKEY, WES", "15-JAN-2023", "14-JAN-2027",
                                                   UIF_CODE="1", UIF_DISPOSITION_DATE="01-MAR-2027")])
         _, row = where(r, "TESTWHISKEY, WES")
-        assert any("UIF blocks a CJR" in x for x in row["reasons"])
+        assert row["status"] == STATUS_REVIEW  # any UIF = REVIEW (owner spec)
+        assert not any("CJR" in x for x in row["reasons"])
 
     def test_uif_zero_is_no_uif(self):
         r = run("dos-reenlistment", [careerist("TESTXRAY, XAN", "15-JUN-2027", UIF_CODE="0")])
@@ -590,7 +577,8 @@ class TestUploadAndPii:
                     "HOME_PHONE_NUMBER", "AGE", "MARITAL_STATUS", "SUPV_NAME", "DUTY_PHONE"):
             assert pii not in cols
         assert {r["id"]: r["available"] for r in body["runs"]} == {
-            "dos-reenlistment": True, "deros-option": True, "re-code-review": True, "btz-quarterly": True}
+            "dos-reenlistment": True, "deros-option": True, "re-code-review": True, "btz-quarterly": True,
+            "cjr-window": True}
         stored = _session_json(body["session_id"])
         for key, sentinel in PII_SENTINELS.items():
             assert sentinel not in stored, key
@@ -615,14 +603,22 @@ class TestApi:
         resp = client.get("/api/v1/rosters/runs", params={"as_of_date": "2026-11-17"})
         assert resp.status_code == 200
         runs = {r["id"]: r for r in resp.json()["runs"]}
-        assert set(runs) == {"dos-reenlistment", "deros-option", "re-code-review", "btz-quarterly"}
+        assert set(runs) == {"dos-reenlistment", "deros-option", "re-code-review", "btz-quarterly", "cjr-window"}
+        assert runs["cjr-window"]["params"][0] == {
+            "name": "approaching_months", "label": "Approaching horizon", "type": "int", "default": 3,
+            "unit": "months", "help": runs["cjr-window"]["params"][0]["help"],
+            "citation": "Owner spec (CJR_APPROACHING_MONTHS) — local preference", "min": 0, "max": 12}
+        assert any("item 36" in d for d in runs["cjr-window"]["duty"])
+        assert any("item 3:" in d for d in runs["cjr-window"]["duty"])
+        assert any("Table 3.1" in r["citation"] for r in runs["cjr-window"]["rule_references"])
         assert any("item 32" in d for d in runs["btz-quarterly"]["duty"])
         assert runs["dos-reenlistment"]["params"][0]["default"] == 12
         assert runs["re-code-review"]["params"][0]["default"] == ["2", "4"]
         assert runs["btz-quarterly"]["params"][0]["default"] == "2027-Q2"
         assert runs["deros-option"]["rule_references"]
 
-    @pytest.mark.parametrize("run_id", ["dos-reenlistment", "deros-option", "re-code-review", "btz-quarterly"])
+    @pytest.mark.parametrize("run_id", ["dos-reenlistment", "deros-option", "re-code-review", "btz-quarterly",
+                                        "cjr-window"])
     def test_run_and_exports(self, client, run_id):
         sid = _upload(client, API_ROWS)["session_id"]
         resp = client.post(f"/api/v1/rosters/{sid}/runs/{run_id}", json={"as_of_date": "2026-11-17"})

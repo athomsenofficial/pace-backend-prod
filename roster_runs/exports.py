@@ -54,9 +54,16 @@ _CHECKBOX = 10  # points
 _MIN_DATE_WIDTH = 54  # points: "15-JAN-2024" at 7.5pt plus padding
 
 
+def quota_text(value) -> str:
+    """BTZ quotas are exact 15% values (owner: no rounding) — always two decimals."""
+    return f"{value:.2f}" if isinstance(value, (int, float)) and not isinstance(value, bool) else str(value)
+
+
 def cell_text(value, kind: str = "text") -> str:
     if value is None or value == "":
         return ""
+    if kind == "decimal" and isinstance(value, (int, float)) and not isinstance(value, bool):
+        return quota_text(value)
     if isinstance(value, (date, datetime)):
         return display_date(value)
     if isinstance(value, bool):
@@ -296,15 +303,15 @@ def _btz_summary_story(result: RunResult) -> list:
     data = [[Paragraph(h, _H_STYLE) for h in head]]
     for u in units:
         data.append([u["pascode"], Paragraph(escape(u["unit"] or ""), _B_STYLE), u["eligible_count"], u["size"],
-                     u["quota"] if u["quota"] is not None else "CBB"])
+                     quota_text(u["quota"]) if u["quota"] is not None else "CBB"])
     cbb_quota = cbb.get("quota")
     cbb_label = f" ({cbb['label']})" if cbb.get("label") else ""
     data.append([Paragraph("<b>CBB pool</b>", _B_STYLE),
                  Paragraph(escape(f"{len(cbb.get('pool_units', []))} small unit(s){cbb_label}"), _B_STYLE),
                  cbb.get("pool_total", 0), "SMALL (pooled)",
-                 cbb_quota if cbb_quota is not None else "See CBB note"])
+                 quota_text(cbb_quota) if cbb_quota is not None else "See CBB note"])
     data.append([Paragraph("<b>Total</b>", _B_STYLE), "", s.get("eligibles", 0), "",
-                 s.get("total_quota", 0)])
+                 quota_text(s.get("total_quota", 0))])
     widths = [PDF_CONTENT_FRAME_WIDTH * w for w in (0.12, 0.43, 0.12, 0.15, 0.18)]
     table = Table(data, colWidths=widths, repeatRows=1)
     table.setStyle(_table_style([
@@ -360,20 +367,20 @@ def build_btz_pdf(result: RunResult) -> bytes:
     for pas in sorted(by_unit):
         rows = by_unit[pas]
         u = units.get(pas, {})
-        quota_text = (str(u["quota"]) if u.get("quota") is not None
+        unit_quota = (quota_text(u["quota"]) if u.get("quota") is not None
                       else "pooled into CBB" if u.get("size") == "SMALL" else "n/a")
         token = _field_token(pas)
         story.append(PageBreak())
         story.append(_section(f"Unit {pas} — {u.get('unit') or rows[0].get('unit') or ''}"))
         story.append(Paragraph(escape(
-            f"Eligibles: {len(rows)}  |  Unit size: {u.get('size', '')}  |  Quota: {quota_text}  |  "
+            f"Eligibles: {len(rows)}  |  Unit size: {u.get('size', '')}  |  Quota: {unit_quota}  |  "
             f"{result.extra.get('quarter', {}).get('label', '')}"), _SMALL_BOLD))
         extra_cols = [
             ("Nominate", 0.75, lambda i, row, t=token: _CheckboxSlot(slots, f"btz_{t}_{i}_nominate")),
             ("Do Not Nominate", 0.85, lambda i, row, t=token: _CheckboxSlot(slots, f"btz_{t}_{i}_do_not_nominate")),
         ]
         story.append(_pdf_table(result.columns, rows, extra_cols))
-        story.append(_signature_block(pas, quota_text))
+        story.append(_signature_block(pas, unit_quota))
 
     if not by_unit:
         story.append(PageBreak())
@@ -455,6 +462,8 @@ def _write_table(ws, columns: list[Column], rows: list[dict], footer_lines: list
             cell = _set_cell(ws, i, j, value)
             if isinstance(value, date):
                 cell.number_format = _XLSX_DATE_FORMAT
+            elif col.kind == "decimal" and isinstance(value, (int, float)):
+                cell.number_format = "0.00"
                 widths[j - 1] = max(widths[j - 1], 12)
             elif value is not None:
                 widths[j - 1] = max(widths[j - 1], min(len(str(value)), 60))
@@ -519,7 +528,7 @@ def build_xlsx(result: RunResult) -> bytes:
         cbb = result.extra.get("cbb", {})
         unit_cols = [Column("pascode", "PASCODE"), Column("unit", "Unit"),
                      Column("eligible_count", "Eligibles", "int"), Column("size", "Unit size"),
-                     Column("quota", "Quota", "int"), Column("quota_note", "Quota note")]
+                     Column("quota", "Quota (exact 15%)", "decimal"), Column("quota_note", "Quota note")]
         unit_rows = [dict(u) for u in units]
         unit_rows.append({"pascode": "CBB POOL", "unit": cbb.get("label") or "Central Base Board",
                           "eligible_count": cbb.get("pool_total", 0), "size": "SMALL (pooled)",

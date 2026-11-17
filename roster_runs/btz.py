@@ -15,12 +15,12 @@ from __future__ import annotations
 import re
 from collections import Counter
 from datetime import date, timedelta
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import Decimal
 
 from board_filter import pafsc_check
 from config.retention import (
     BTZ_BOARD_OFFSET_MONTHS, BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA, BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA,
-    BTZ_CBB_POLICY_NOTE, BTZ_COMBINE_WITH_LARGE_NOTE, BTZ_QUOTA_COUNT_NOTE, BTZ_ROUNDING_NOTE,
+    BTZ_CBB_POLICY_NOTE, BTZ_COMBINE_WITH_LARGE_NOTE, BTZ_QUOTA_COUNT_NOTE, BTZ_QUOTA_DECIMALS, BTZ_ROUNDING_NOTE,
     BTZ_SINGLE_ELIGIBLE_NOTE,
     BTZ_CONTROL_ROSTER_RE, BTZ_DATE_CITATION, BTZ_FOOTER, BTZ_GSR_STANDING_NOTE,
     BTZ_LARGE_UNIT_THRESHOLD, BTZ_MIN_SKILL_LEVEL, BTZ_MONTHS_EARLY, BTZ_PCS_CITATION,
@@ -137,10 +137,19 @@ def quarter_options(as_of: date) -> list[dict]:
 # Quotas (AFI 36-2502 paras 2.3.5-2.3.7)
 # =============================================================================
 
-def quota_for(count: int) -> int:
-    """15% (para 2.3.5) rounded half-up (PACE rule): 7-9 = 1, 10-16 = 2, 17-23 = 3, 24-29 = 4, 30-36 = 5."""
+def quota_for(count: int) -> float:
+    """Exact 15% of the eligibles (para 2.3.5), two decimals, NOT rounded to a whole number.
+
+    Owner decision 17 Nov 2026: AFI 36-2502 sets no rounding rule; the MPF
+    determines the whole-number quota. 10 -> 1.50, 17 -> 2.55.
+    """
     value = Decimal(count) * Decimal(BTZ_QUOTA_RATE_PERCENT) / Decimal(100)
-    return int(value.quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    return float(value.quantize(Decimal(1).scaleb(-BTZ_QUOTA_DECIMALS)))
+
+
+def _sum_quotas(values) -> float:
+    total = sum((Decimal(str(v)) for v in values if v is not None), Decimal(0))
+    return float(total.quantize(Decimal(1).scaleb(-BTZ_QUOTA_DECIMALS)))
 
 
 def compute_quotas(unit_counts: dict[str, int], unit_names: dict[str, str], single_unit_roster: bool):
@@ -157,37 +166,34 @@ def compute_quotas(unit_counts: dict[str, int], unit_names: dict[str, str], sing
             "eligible_count": n,
             "size": SIZE_LARGE if large else SIZE_SMALL,
             "quota": quota_for(n) if large else None,
+            "quota_display": f"{quota_for(n):.2f}" if large else "",
             "quota_note": "Own quota" if large else "Pooled into CBB",
         })
     pool_units = [u["pascode"] for u in units if u["size"] == SIZE_SMALL]
     pool = sum(u["eligible_count"] for u in units if u["size"] == SIZE_SMALL)
     any_large = any(u["size"] == SIZE_LARGE for u in units)
     base_wide = sum(u["eligible_count"] for u in units)
-    combine_with_large = False
     if base_wide == 1:
         # para 2.3.5.4
         quota, note = None, BTZ_SINGLE_ELIGIBLE_NOTE
     elif not any_large and BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA <= pool <= BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA:
         # para 2.3.5.3
-        quota, note = 1, (f"No large units and {BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA}-{BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA} "
-                          "small-unit eligibles: one CBB quota (AFI 36-2502 para 2.3.5.3).")
-    elif any_large and pool > 0 and quota_for(pool) == 0:
-        # para 2.3.5.2: large unit + small units combine at the CBB
-        quota, note, combine_with_large = None, BTZ_COMBINE_WITH_LARGE_NOTE, True
-        for u in units:
-            if u["size"] == SIZE_LARGE:
-                u["quota_note"] = "Own quota; combines with the small units at the CBB (para 2.3.5.2)"
+        quota, note = 1.0, (f"No large units and {BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA}-{BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA} "
+                            "small-unit eligibles: one CBB quota (AFI 36-2502 para 2.3.5.3).")
     else:
+        # Owner decision 17 Nov 2026: always 15% of the total pooled small-unit eligibles.
         quota = quota_for(pool)
-        note = (f"{BTZ_QUOTA_RATE_PERCENT}% of {pool} pooled small-unit eligibles, rounded half-up "
-                "(AFI 36-2502 para 2.3.5).")
+        note = (f"{BTZ_QUOTA_RATE_PERCENT}% of {pool} pooled small-unit eligibles = {quota:.2f} (AFI 36-2502 para "
+                f"2.3.5). {BTZ_ROUNDING_NOTE}")
+        if any_large and pool:
+            note += " " + BTZ_COMBINE_WITH_LARGE_NOTE
     cbb = {
         "pool_units": pool_units,
         "pool_total": pool,
         "quota": quota,
+        "quota_display": f"{quota:.2f}" if quota is not None else "",
         "note": note,
         "requires_base_wide_roster": single_unit_roster,
-        "combine_with_large_unit": combine_with_large,
         "policy_note": BTZ_CBB_POLICY_NOTE,
         "label": CBB_REQUIRES_BASE_WIDE if single_unit_roster else "",
     }
@@ -338,7 +344,7 @@ def run_btz_quarterly(records_or_members, as_of: date, params: dict, columns: se
     for b in (data_issue, previously, non_regaf):
         b.rows.sort(key=lambda r: (r["pascode"], r["name"].upper()))
 
-    large_quota = sum(u["quota"] or 0 for u in units if u["size"] == SIZE_LARGE)
+    large_quota = _sum_quotas(u["quota"] for u in units if u["size"] == SIZE_LARGE)
     summary = {
         "total_records": len(members),
         "officers_excluded": officers,
@@ -349,7 +355,7 @@ def run_btz_quarterly(records_or_members, as_of: date, params: dict, columns: se
         "large_unit_quota_total": large_quota,
         "cbb_pool_total": cbb["pool_total"],
         "cbb_quota": cbb["quota"],
-        "total_quota": large_quota + (cbb["quota"] or 0),
+        "total_quota": _sum_quotas([large_quota, cbb["quota"]]),
         "btz_date_before_quarter": before,
         "btz_date_after_quarter": after,
         "previously_considered": len(previously.rows),

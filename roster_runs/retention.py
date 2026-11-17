@@ -15,7 +15,7 @@ from datetime import date, datetime, timedelta
 
 from config.domain import MAIN_HIGHER_TENURE
 from config.retention import (
-    CJR_REQUIRED_CITATION, CJR_SELECTED_RE_CODE, CJR_WINDOW_CITATION, CJR_WINDOWS_BY_TERM_MONTHS, CSS_DUTIES,
+    CSS_DUTIES,
     DEROS_FLAG_INSUFFICIENT_RETAINABILITY, DEROS_FLAG_NO_ASSIGNMENT, DEROS_RIP_NOTE,
     EXTENSION_CAP_MONTHS, EXTENSION_REASON_NOTE, FOUR_YEAR_TERM_MONTHS, HYT_LIMIT_CITATION,
     HYT_RE_CODES, HYT_TENURE_CITATION, HYT_YEARS_NOT_IN_MEL, INDEFINITE_DEROS_NOTE,
@@ -23,9 +23,9 @@ from config.retention import (
     NOT_YET_SRP_CONSIDERED_RE_CODES, OS_TO_CONUS_RETAINABILITY_CITATION, RE_CLASS_BARRED,
     RE_CLASS_ELIGIBLE, RE_CODES_CANNOT_EXTEND, RE_DEFINITION_UNKNOWN, RE_TABLES_CITATION,
     REENLISTMENT_ACTION_CITATION, REENLISTMENT_ACTION_DAYS_BEFORE_DOS, REENLISTMENT_NOTIFY_DAYS_BEFORE_DOS,
-    REENLISTMENT_RE_CODES, RETENTION_FOOTER, REVIEW_RE_CODES, SIX_YEAR_TERM_MONTHS, SRP_PENDING_RE_CODES,
+    REENLISTMENT_RE_CODES, RETENTION_FOOTER, REVIEW_RE_CODES, SIX_YEAR_TERM_MONTHS, OWNER_ELIGIBLE_RE_CODES,
     STATUS_ELIGIBLE, STATUS_ELIGIBLE_NYSC, STATUS_HYT, STATUS_INELIGIBLE, STATUS_INELIGIBLE_WAIVABLE,
-    STATUS_PRECEDENCE, STATUS_REVIEW, UIF_BLOCKS_CJR_CITATION,
+    STATUS_PRECEDENCE, STATUS_REVIEW,
 )
 from eligibility_calculators import compute_hyt_date
 
@@ -68,7 +68,7 @@ def _yes_no(value) -> str:
 
 
 # =============================================================================
-# Term / extension / CJR / HYT analysis (shared by Runs 1 and 2)
+# Term / extension / HYT analysis (shared by Runs 1 and 2; CJR has its own run, cjr.py)
 # =============================================================================
 
 @dataclass
@@ -201,35 +201,11 @@ def _analyze_term(m: Member, as_of: date, a: Assessment) -> None:
         f["extension_note"] = f"RE {m.re_code}: {RE_CODES_CANNOT_EXTEND[m.re_code]}."
     elif rem_hi == 0:
         f["extension_note"] = f"{cap}-month extension cap reached (cannot be waived, DAFI 36-2606 para 6.2.2)."
-    elif m.re_code[:1] in ("2", "3", "4"):
+    elif m.re_code[:1] in ("2", "3", "4") and m.re_code not in OWNER_ELIGIBLE_RE_CODES:
         f["extension_note"] = INELIGIBLE_EXTENSION_NOTE
     else:
         f["extension_note"] = EXTENSION_REASON_NOTE
 
-    # --- CJR (first-termers): required to reenlist (para 3.1.1); window per Table 3.1 (months 32-43 / 56-67)
-    cjr_text = "N/A (not first term)" if first_term is False else ""
-    if first_term:
-        if candidates and doe.ok:
-            month_no = whole_months(doe.value, as_of) + 1
-            parts, flagged = [], []
-            for term_months in candidates:
-                start, end = CJR_WINDOWS_BY_TERM_MONTHS[term_months]
-                where = "before window" if month_no < start else "in window" if month_no <= end else "past window"
-                label = f"{term_months // 12}-year"
-                parts.append(f"{label}: {where} ({start}-{end})")
-                if month_no >= start and m.re_code != CJR_SELECTED_RE_CODE:
-                    flagged.append(f"{where} for a {label} enlistment (months {start}-{end})")
-            cjr_text = f"Month {month_no}; " + "; ".join(parts)
-            f["month_of_enlistment"] = month_no
-            if flagged:
-                a.add(STATUS_REVIEW,
-                      f"First-term airman {' / '.join(flagged)} ({CJR_WINDOW_CITATION}) without RE "
-                      f"{CJR_SELECTED_RE_CODE} — CJR required to reenlist ({CJR_REQUIRED_CITATION})")
-        else:
-            cjr_text = "Term unknown — verify CJR in MilPDS"
-            if m.re_code != CJR_SELECTED_RE_CODE:
-                a.add(INFO, "First-term airman, term unknown — verify CJR status in MilPDS")
-    f["cjr"] = cjr_text
 
     # --- HYT (computed from TAFMSD + grade; compute_hyt_date is the MEL's own calc)
     hyt = None
@@ -279,8 +255,6 @@ def assess_reenlistment(m: Member, as_of: date) -> Assessment:
         a.add(STATUS_HYT, f"RE {code}: {info['definition']}")
     elif code in REVIEW_RE_CODES:
         a.add(STATUS_REVIEW, f"RE {code}: {REVIEW_RE_CODES[code]}")
-    elif code in SRP_PENDING_RE_CODES:
-        a.add(STATUS_REVIEW, f"RE {code}: {SRP_PENDING_RE_CODES[code]}")
     elif code in NOT_YET_SRP_CONSIDERED_RE_CODES:
         a.add(STATUS_ELIGIBLE_NYSC, f"RE {code}: {info['definition']}")
     elif info["eligibility_class"] == RE_CLASS_ELIGIBLE:
@@ -295,7 +269,7 @@ def assess_reenlistment(m: Member, as_of: date) -> Assessment:
 
     _analyze_term(m, as_of, a)
 
-    # --- UIF: any code = REVIEW; show disposition vs DOS; blocks CJR for first-termers
+    # --- UIF: any code = REVIEW; show disposition vs DOS (CJR effect: owner decision, none in Run 1)
     dos = m.date("DOS")
     disp = m.date("UIF_DISPOSITION_DATE")
     f["uif_code"] = m.uif_code if uif_present(m.uif_code) else ""
@@ -313,8 +287,6 @@ def assess_reenlistment(m: Member, as_of: date) -> Assessment:
         f["uif_vs_dos"] = rel
         shown = display_date(disp.value) if disp.ok else "n/a"
         a.add(STATUS_REVIEW, f"UIF code {m.uif_code}, disposition {shown} ({rel})")
-        if f.get("first_term") == "Yes":
-            a.add(STATUS_REVIEW, f"UIF blocks a CJR for first-term airmen ({UIF_BLOCKS_CJR_CITATION})")
 
     f["status"] = a.status
     f["reasons"] = a.reason_texts()
@@ -393,7 +365,6 @@ RUN1_COLUMNS = [
     Column("status", "Status", "text", 1.3),
     Column("reasons", "Reasons", "list", 3.6),
     Column("first_term", "1st term", "text", 0.6),
-    Column("cjr", "CJR window", "text", 1.5),
     Column("extension_remaining", f"Ext mos left ({EXTENSION_CAP_MONTHS} cap)", "text", 0.9),
     Column("term", "Term", "text", None),
     Column("extension_history", "Extension history", "text", None),
@@ -500,7 +471,7 @@ def run_dos_reenlistment(records_or_members, as_of: date, params: dict, columns:
     }
     warnings = _missing_column_warnings(columns, {
         "ETS": "pending extensions estimated from DOE->DOS for first-termers only.",
-        "DOE": "first-term status and CJR window cannot be determined.",
+        "DOE": "first-term status cannot be determined.",
         "TAFMSD": "HYT cannot be computed and first-term status is unknown.",
         "REENL_ELIG_STATUS": "every member is REVIEW (no RE code).",
         "UIF_CODE": "UIF check skipped.",
@@ -514,8 +485,6 @@ def run_dos_reenlistment(records_or_members, as_of: date, params: dict, columns:
         "taken effect.",
         "First term = DOE equals TAFMSD (no prior service, never reenlisted). HYT is computed from TAFMSD and "
         f"grade ({HYT_TENURE_CITATION}; verify against MilPDS).",
-        f"CJR window: months 32-43 of a 4-year or 56-67 of a 6-year enlistment ({CJR_WINDOW_CITATION}); RE "
-        f"{CJR_SELECTED_RE_CODE} is used as the CJR indicator (the MilPDS CJR code is not in the export).",
         EXTENSION_REASON_NOTE,
         "RE 3B cannot extend while SRP reconsideration is pending; RE 2V with an approved retirement cannot extend "
         "(DAFI 36-2606 paras 6.6.5, 6.6.5.1.1).",
