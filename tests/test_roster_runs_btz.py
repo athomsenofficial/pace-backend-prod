@@ -7,7 +7,9 @@ import fitz
 import pytest
 from openpyxl import load_workbook
 
-from config.retention import BTZ_FOOTER, BTZ_GSR_STANDING_NOTE, BTZ_PRIOR_SERVICE_NOTE
+from config.retention import (
+    BTZ_CBB_POLICY_NOTE, BTZ_FOOTER, BTZ_GSR_STANDING_NOTE, BTZ_PRIOR_SERVICE_NOTE, RULE_REFERENCES,
+)
 from roster_runs.btz import (
     CBB_REQUIRES_BASE_WIDE, compute_quotas, default_quarter, fully_qualified_date, parse_quarter, quarter_info,
     quota_for,
@@ -145,16 +147,30 @@ class TestQuotas:
         r = run(rows)
         assert r.extra["cbb"]["quota"] == 1 and "No large units" in r.extra["cbb"]["note"]
 
-    def test_small_pool_with_large_units_rounds(self):
+    def test_small_pool_too_small_with_large_unit_combines_at_cbb(self):
+        # AFI 36-2502 para 2.3.5.2: a large unit exists and the small units cannot make one quota at 15%
+        # -> the large unit and small units combine to meet at the central base board.
         units, cbb = compute_quotas({"ZZLTEST": 10, "ZZSTEST": 2}, {}, False)
-        assert cbb["quota"] == 0  # 15% of 2 = 0.3 -> 0 when large units exist
+        assert cbb["quota"] is None and cbb["combine_with_large_unit"] is True
+        assert "para 2.3.5.2" in cbb["note"]
+        assert "para 2.3.5.2" in units[0]["quota_note"] and units[0]["quota"] == 2
+
+    def test_small_pool_with_large_unit_that_makes_a_quota(self):
+        units, cbb = compute_quotas({"ZZLTEST": 10, "ZZSTEST": 4}, {}, False)
+        assert cbb["quota"] == 1 and cbb["combine_with_large_unit"] is False  # 0.6 -> 1
+
+    def test_cbb_policy_note_cited(self):
+        r = run([in_q2("TESTPOLICY, PO")])
+        assert BTZ_CBB_POLICY_NOTE in r.notes and r.extra["cbb"]["policy_note"] == BTZ_CBB_POLICY_NOTE
+        assert "para 2.4.2.1" in BTZ_CBB_POLICY_NOTE and "17 Nov 2026" in BTZ_CBB_POLICY_NOTE
+        assert "fewer than seven eligibles" in BTZ_CBB_POLICY_NOTE
 
     def test_single_eligible_base_wide(self):
         rows = [in_q2("TESTSOLO, SOL", "ZZ1TEST"),
                 member("TESTOTHER, OTH", "SSG", ASSIGNED_PAS="ZZ2TEST")]
         r = run(rows)
         assert r.extra["cbb"]["quota"] is None
-        assert "MPF/CC decision" in r.extra["cbb"]["note"]
+        assert "MPF commander decides" in r.extra["cbb"]["note"] and "para 2.3.5.4" in r.extra["cbb"]["note"]
         assert r.summary["total_quota"] == 0
         assert r.extra["cbb"]["requires_base_wide_roster"] is False
 
@@ -182,7 +198,8 @@ class TestFlagsAndBuckets:
         assert remarks["TESTART15, AR"] == ["Suspended Article 15 (RE 4H)"]
         assert remarks["TESTSKILL, SK"] == ["Skill level below 3"]
         assert remarks["TESTUIF, UI"] == ["UIF code 2, disposition 01-JUN-2027"]
-        assert remarks["TESTRE, RE"] == ["RE 2X: Non-selected"]
+        assert remarks["TESTRE, RE"] == ["RE 2X: Non-selected for reenlistment (or non-selected for continued "
+                                         "service under the NCO Career Status Program)"]
         assert remarks["TESTCLEAN, CL"] == []
 
     def test_previously_considered_5q_excluded(self):
@@ -313,3 +330,36 @@ class TestBtzExports:
         assert body["quarter"]["id"] == "2027-Q2" and body["rows"][0]["btz_date"] == "2027-05-10"
         assert body["units"][0]["size"] == "SMALL" and body["cbb"]["requires_base_wide_roster"] is True
         assert any(o["default"] for o in body["quarter_options"])
+
+
+class TestPublicationAlignment:
+    """AFI 36-2502 (2 Jul 2026) and the SrA BTZ Eligibility Determination Chart (04 Jun 2021)."""
+
+    @pytest.mark.parametrize("tafmsd,dor,fq", [
+        # Chart columns 1 & 2 (AB/Amn entrants): TAFMSD Jan-Mar 19 AND DOR May-Jul 20 -> FQ Jan-Mar 22.
+        (date(2019, 1, 1), date(2020, 5, 1), date(2022, 1, 1)),
+        (date(2019, 3, 1), date(2020, 7, 1), date(2022, 3, 1)),
+        # Chart column 3 (A1C entrants): DOR Sep-Nov 19 -> FQ Jan-Mar 22 (28 months TIG).
+        (date(2019, 9, 1), date(2019, 9, 1), date(2022, 1, 1)),
+        (date(2019, 11, 1), date(2019, 11, 1), date(2022, 3, 1)),
+    ])
+    def test_chart_rows(self, tafmsd, dor, fq):
+        got, _ = fully_qualified_date(tafmsd, dor)
+        assert got == fq
+        # Chart: FQ Jan-Mar 22 -> BTZ promotion Jul-Sep 21 -> board Jun 21 (Table 2.7 item 2).
+        info = quarter_info(2021, 3)
+        assert info["board_month"] == "JUN-2021" and info["processing_months"] == ["APR-2021", "MAY-2021"]
+        from roster_runs.btz import btz_date
+        assert info["btz_date_start"] <= btz_date(got) <= info["btz_date_end"]
+
+    def test_footer_and_citations_name_afi_2_jul_2026(self):
+        assert BTZ_FOOTER.endswith("per AFI 36-2502 (2 Jul 2026).")
+        btz = [r for r in RULE_REFERENCES if r[0] == "btz-quarterly"]
+        assert btz and all("DAFI 36-2502" not in r[3] for r in btz)
+        assert any(r[1] == "Quota rounding" and "Not stated in the publication" in r[4] for r in btz)
+
+    def test_pdf_summary_prints_cbb_policy(self):
+        r = run([in_q2("TESTPDFPOL, PP", "ZZATEST"), in_q2("TESTPDFPOL, PQ", "ZZBTEST")])
+        doc = fitz.open(stream=build_pdf(r), filetype="pdf")
+        text = doc[0].get_text().replace("\n", " ")
+        assert "Policy:" in text and "2.4.2.1" in text

@@ -15,16 +15,17 @@ from datetime import date, datetime, timedelta
 
 from config.domain import MAIN_HIGHER_TENURE
 from config.retention import (
-    CJR_REQUIRED_CITATION, CJR_SELECTED_RE_CODE, CJR_WINDOWS_BY_TERM_MONTHS, CSS_DUTIES,
+    CJR_REQUIRED_CITATION, CJR_SELECTED_RE_CODE, CJR_WINDOW_CITATION, CJR_WINDOWS_BY_TERM_MONTHS, CSS_DUTIES,
     DEROS_FLAG_INSUFFICIENT_RETAINABILITY, DEROS_FLAG_NO_ASSIGNMENT, DEROS_RIP_NOTE,
     EXTENSION_CAP_MONTHS, EXTENSION_REASON_NOTE, FOUR_YEAR_TERM_MONTHS, HYT_LIMIT_CITATION,
-    HYT_RE_CODES, INDEFINITE_DEROS_NOTE, INDEFINITE_DEROS_RETAINABILITY_MONTHS,
+    HYT_RE_CODES, HYT_TENURE_CITATION, HYT_YEARS_NOT_IN_MEL, INDEFINITE_DEROS_NOTE,
+    INDEFINITE_DEROS_RETAINABILITY_MONTHS, INELIGIBLE_EXTENSION_NOTE,
     NOT_YET_SRP_CONSIDERED_RE_CODES, OS_TO_CONUS_RETAINABILITY_CITATION, RE_CLASS_BARRED,
-    RE_CLASS_ELIGIBLE, RE_CODES_CANNOT_EXTEND, RE_DEFINITION_UNVERIFIED,
-    REENLISTMENT_ACTION_DAYS_BEFORE_DOS, REENLISTMENT_RE_CODES, RETENTION_FOOTER,
-    REVIEW_RE_CODES, SIX_YEAR_TERM_MONTHS, STATUS_ELIGIBLE, STATUS_ELIGIBLE_NYSC, STATUS_HYT,
-    STATUS_INELIGIBLE, STATUS_INELIGIBLE_WAIVABLE, STATUS_PRECEDENCE, STATUS_REVIEW,
-    UIF_BLOCKS_CJR_CITATION,
+    RE_CLASS_ELIGIBLE, RE_CODES_CANNOT_EXTEND, RE_DEFINITION_UNKNOWN, RE_TABLES_CITATION,
+    REENLISTMENT_ACTION_CITATION, REENLISTMENT_ACTION_DAYS_BEFORE_DOS, REENLISTMENT_NOTIFY_DAYS_BEFORE_DOS,
+    REENLISTMENT_RE_CODES, RETENTION_FOOTER, REVIEW_RE_CODES, SIX_YEAR_TERM_MONTHS, SRP_PENDING_RE_CODES,
+    STATUS_ELIGIBLE, STATUS_ELIGIBLE_NYSC, STATUS_HYT, STATUS_INELIGIBLE, STATUS_INELIGIBLE_WAIVABLE,
+    STATUS_PRECEDENCE, STATUS_REVIEW, UIF_BLOCKS_CJR_CITATION,
 )
 from eligibility_calculators import compute_hyt_date
 
@@ -48,10 +49,11 @@ def re_lookup(code: str) -> dict:
         "code": code,
         "known": False,
         "series": code[:1] if code else "",
-        "definition": RE_DEFINITION_UNVERIFIED if code else "No RE code on roster",
+        "definition": RE_DEFINITION_UNKNOWN if code else "No RE code on roster",
         "eligibility_class": "UNKNOWN — REVIEW" if code else "",
         "waivable": None,
         "waiver_authority": "",
+        "citation": RE_TABLES_CITATION if code else "",
     }
 
 
@@ -60,6 +62,8 @@ def _yes_no(value) -> str:
         return "Yes"
     if value is False:
         return "No"
+    if isinstance(value, str):
+        return value  # e.g. "Conditional"
     return ""
 
 
@@ -194,13 +198,15 @@ def _analyze_term(m: Member, as_of: date, a: Assessment) -> None:
 
     # --- extension eligibility
     if m.re_code in RE_CODES_CANNOT_EXTEND:
-        f["extension_note"] = f"RE {m.re_code}: cannot extend."
+        f["extension_note"] = f"RE {m.re_code}: {RE_CODES_CANNOT_EXTEND[m.re_code]}."
     elif rem_hi == 0:
-        f["extension_note"] = f"{cap}-month extension cap reached."
+        f["extension_note"] = f"{cap}-month extension cap reached (cannot be waived, DAFI 36-2606 para 6.2.2)."
+    elif m.re_code[:1] in ("2", "3", "4"):
+        f["extension_note"] = INELIGIBLE_EXTENSION_NOTE
     else:
         f["extension_note"] = EXTENSION_REASON_NOTE
 
-    # --- CJR (first-termers): required to reenlist (para 3.1.1); window per Table 3.1
+    # --- CJR (first-termers): required to reenlist (para 3.1.1); window per Table 3.1 (months 32-43 / 56-67)
     cjr_text = "N/A (not first term)" if first_term is False else ""
     if first_term:
         if candidates and doe.ok:
@@ -217,8 +223,8 @@ def _analyze_term(m: Member, as_of: date, a: Assessment) -> None:
             f["month_of_enlistment"] = month_no
             if flagged:
                 a.add(STATUS_REVIEW,
-                      f"First-term airman {' / '.join(flagged)} without RE {CJR_SELECTED_RE_CODE} — "
-                      f"CJR required to reenlist ({CJR_REQUIRED_CITATION})")
+                      f"First-term airman {' / '.join(flagged)} ({CJR_WINDOW_CITATION}) without RE "
+                      f"{CJR_SELECTED_RE_CODE} — CJR required to reenlist ({CJR_REQUIRED_CITATION})")
         else:
             cjr_text = "Term unknown — verify CJR in MilPDS"
             if m.re_code != CJR_SELECTED_RE_CODE:
@@ -232,6 +238,10 @@ def _analyze_term(m: Member, as_of: date, a: Assessment) -> None:
         hyt = compute_hyt_date(datetime(t.year, t.month, t.day), m.grade).date()
         f["hyt_date"] = hyt
         f["hyt_basis"] = "computed"
+    elif tafmsd.ok and m.grade in HYT_YEARS_NOT_IN_MEL:
+        hyt = add_months(tafmsd.value, 12 * HYT_YEARS_NOT_IN_MEL[m.grade])
+        f["hyt_date"] = hyt
+        f["hyt_basis"] = f"computed ({HYT_YEARS_NOT_IN_MEL[m.grade]} years, {HYT_TENURE_CITATION})"
     else:
         f["hyt_date"] = None
         f["hyt_basis"] = ("not computed (no TAFMSD)" if not tafmsd.ok
@@ -259,26 +269,29 @@ def assess_reenlistment(m: Member, as_of: date) -> Assessment:
     })
 
     # --- RE code (DAFI 36-2606 Tables 5.2-5.6)
+    f["re_citation"] = info.get("citation", "")
     code = m.re_code
     if not code:
         a.add(STATUS_REVIEW, "No RE code on roster — verify in MilPDS")
     elif not info["known"]:
-        a.add(STATUS_REVIEW, f"RE {code}: not in PACE RE map — {RE_DEFINITION_UNVERIFIED}")
+        a.add(STATUS_REVIEW, f"RE {code}: {RE_DEFINITION_UNKNOWN}")
     elif code in HYT_RE_CODES:
         a.add(STATUS_HYT, f"RE {code}: {info['definition']}")
     elif code in REVIEW_RE_CODES:
         a.add(STATUS_REVIEW, f"RE {code}: {REVIEW_RE_CODES[code]}")
+    elif code in SRP_PENDING_RE_CODES:
+        a.add(STATUS_REVIEW, f"RE {code}: {SRP_PENDING_RE_CODES[code]}")
     elif code in NOT_YET_SRP_CONSIDERED_RE_CODES:
         a.add(STATUS_ELIGIBLE_NYSC, f"RE {code}: {info['definition']}")
     elif info["eligibility_class"] == RE_CLASS_ELIGIBLE:
         a.add(STATUS_ELIGIBLE, f"RE {code}: {info['definition']}")
     elif info["eligibility_class"] == RE_CLASS_BARRED:
         a.add(STATUS_INELIGIBLE, f"RE {code}: {info['definition']} (barred)")
-    elif info["waivable"]:
+    elif info["waivable"] is True:
         a.add(STATUS_INELIGIBLE_WAIVABLE,
-              f"RE {code}: {info['definition']} (waivable — {info['waiver_authority']})")
+              f"RE {code}: {info['definition']} — waivable: {info['waiver_authority']}")
     else:
-        a.add(STATUS_INELIGIBLE, f"RE {code}: {info['definition']}")
+        a.add(STATUS_INELIGIBLE, f"RE {code}: {info['definition']} — {info['waiver_authority']}")
 
     _analyze_term(m, as_of, a)
 
@@ -376,6 +389,7 @@ RUN1_COLUMNS = [
     Column("re_class", "RE class", "text", None),
     Column("re_waivable", "Waivable", "text", None),
     Column("re_waiver_authority", "Waiver authority", "text", None),
+    Column("re_citation", "RE source", "text", None),
     Column("status", "Status", "text", 1.3),
     Column("reasons", "Reasons", "list", 3.6),
     Column("first_term", "1st term", "text", 0.6),
@@ -494,12 +508,17 @@ def run_dos_reenlistment(records_or_members, as_of: date, params: dict, columns:
     notes = [
         f"Window: DOS from {display_date(as_of)} through {display_date(horizon)} ({window} months).",
         f"Action-by date = DOS minus {REENLISTMENT_ACTION_DAYS_BEFORE_DOS} days: reenlistment must be projected "
-        "with the MPF by then or the member is projected for separation.",
+        f"with the MPF by then or the member is projected for separation ({REENLISTMENT_ACTION_CITATION}). The MPF "
+        f"notifies reenlistment-eligible members NLT {REENLISTMENT_NOTIFY_DAYS_BEFORE_DOS} days before DOS.",
         "Pending (not yet effective) extension months = ETS to DOS. ETS already includes extensions that have "
         "taken effect.",
         "First term = DOE equals TAFMSD (no prior service, never reenlisted). HYT is computed from TAFMSD and "
-        "grade (verify against MilPDS).",
-        EXTENSION_REASON_NOTE + " RE 3B cannot extend.",
+        f"grade ({HYT_TENURE_CITATION}; verify against MilPDS).",
+        f"CJR window: months 32-43 of a 4-year or 56-67 of a 6-year enlistment ({CJR_WINDOW_CITATION}); RE "
+        f"{CJR_SELECTED_RE_CODE} is used as the CJR indicator (the MilPDS CJR code is not in the export).",
+        EXTENSION_REASON_NOTE,
+        "RE 3B cannot extend while SRP reconsideration is pending; RE 2V with an approved retirement cannot extend "
+        "(DAFI 36-2606 paras 6.6.5, 6.6.5.1.1).",
     ]
     return RunResult(
         run_id="dos-reenlistment",
@@ -663,7 +682,7 @@ def run_deros_option(records_or_members, as_of: date, params: dict, columns: set
                 row["notes"].append(a.fields["extension_note"])
             elif lo is not None and lo >= months_short:
                 row["notes"].append(f"Extension room covers the {months_short}-month shortfall "
-                                    "(service-directed reason needed, DAFI 36-2606 Table 6.2).")
+                                    "(Table 6.2 reason needed, e.g. Rule 12 PCS retainability, DAFI 36-2606).")
             elif hi is not None and hi < months_short:
                 row["notes"].append(f"Extension room ({hi} mos max) is less than the shortfall — reenlistment "
                                     "needed to obtain retainability.")
@@ -729,6 +748,7 @@ RUN3_COLUMNS = [
     Column("re_class", "Class", "text", 1.1),
     Column("re_waivable", "Waivable", "text", 0.6),
     Column("re_waiver_authority", "Waiver authority", "text", 1.5),
+    Column("re_citation", "RE source", "text", None),
     Column("dos", "DOS", "date", 1.0),
     Column("months_to_dos", "Mos to DOS", "int", 0.6),
     Column("uif_code", "UIF", "text", 0.4),
@@ -763,6 +783,7 @@ def run_re_code_review(records_or_members, as_of: date, params: dict, columns: s
             "re_class": info["eligibility_class"],
             "re_waivable": _yes_no(info["waivable"]),
             "re_waiver_authority": info["waiver_authority"],
+            "re_citation": info.get("citation", ""),
             "dos": dos.out(),
             "months_to_dos": whole_months(as_of, dos.value) if dos.ok else None,
             "uif_code": m.uif_code if uif_present(m.uif_code) else "",
@@ -793,7 +814,8 @@ def run_re_code_review(records_or_members, as_of: date, params: dict, columns: s
     warnings = _missing_column_warnings(columns, {"DOS": "months to DOS cannot be shown."})
     notes = [
         f"Lists every enlisted member whose RE code starts with: {', '.join(prefixes)}. Sorted by DOS.",
-        "Codes not in PACE's RE map show \"" + RE_DEFINITION_UNVERIFIED + "\".",
+        f"Definitions, classes and waiver authorities: {RE_TABLES_CITATION} and Table 5.6 (22 May 2024, Chg 1).",
+        "Codes not in the publication tables show \"" + RE_DEFINITION_UNKNOWN + "\".",
     ]
     return RunResult(
         run_id="re-code-review",

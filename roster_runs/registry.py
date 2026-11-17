@@ -186,7 +186,7 @@ _register(RunDef(
     params=(RunParam("quarter", "BTZ quarter", "quarter", None, None,
                      "Calendar quarter of the BTZ dates, e.g. 2027-Q2 (BTZ dates Apr-Jun 2027, processed Jan/Feb, "
                      "board Mar). Default: the cycle whose first processing month is the current or next month.",
-                     "DAFI 36-2502 Table 2.7 (spec cites AFI 36-2502) — verify"),),
+                     "AFI 36-2502 (2 Jul 2026) Table 2.7"),),
     compute=run_btz_quarterly,
 ))
 

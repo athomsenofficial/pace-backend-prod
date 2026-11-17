@@ -302,7 +302,7 @@ def _btz_summary_story(result: RunResult) -> list:
     data.append([Paragraph("<b>CBB pool</b>", _B_STYLE),
                  Paragraph(escape(f"{len(cbb.get('pool_units', []))} small unit(s){cbb_label}"), _B_STYLE),
                  cbb.get("pool_total", 0), "SMALL (pooled)",
-                 cbb_quota if cbb_quota is not None else "MPF/CC decision"])
+                 cbb_quota if cbb_quota is not None else "See CBB note"])
     data.append([Paragraph("<b>Total</b>", _B_STYLE), "", s.get("eligibles", 0), "",
                  s.get("total_quota", 0)])
     widths = [PDF_CONTENT_FRAME_WIDTH * w for w in (0.12, 0.43, 0.12, 0.15, 0.18)]
@@ -316,6 +316,8 @@ def _btz_summary_story(result: RunResult) -> list:
     story.append(table)
     story.append(Spacer(1, 4))
     story.append(Paragraph("<b>CBB:</b> " + escape(str(cbb.get("note", ""))), _SMALL))
+    if cbb.get("policy_note"):
+        story.append(Paragraph("<b>Policy:</b> " + escape(str(cbb["policy_note"])), _SMALL))
     if cbb.get("requires_base_wide_roster"):
         story.append(Paragraph("<b>CBB math requires base-wide roster</b> — this upload covers one unit only.",
                                _SMALL))
@@ -493,7 +495,7 @@ def _info_sheet(wb, result: RunResult, used: set) -> None:
              for line in _summary_lines(result.summary)]
     rows += [("Note", n) for n in result.notes]
     rows += [("Warning", w) for w in result.warnings]
-    rows += [(f"Verify: {r[1]}", f"{r[2]} — {r[3]} — {r[4]}") for r in RULE_REFERENCES if r[0] == result.run_id]
+    rows += [(f"Rule: {r[1]}", f"{r[2]} — {r[3]} — {r[4]}") for r in RULE_REFERENCES if r[0] == result.run_id]
     for i, (key, value) in enumerate(rows, start=1):
         _set_cell(ws, i, 1, key).font = Font(bold=True)
         cell = _set_cell(ws, i, 2, value)

@@ -8,7 +8,7 @@ import io
 import json
 import logging
 import os
-from datetime import date
+from datetime import date, timedelta
 
 import fitz
 import pytest
@@ -17,7 +17,8 @@ from openpyxl import load_workbook
 from config.columns import ROSTER_COLUMN_ALIASES
 from config.domain import RE_CODES
 from config.retention import (
-    REENLISTMENT_RE_CODES, RE_DEFINITION_UNVERIFIED, RETENTION_FOOTER, STATUS_ELIGIBLE, STATUS_ELIGIBLE_NYSC,
+    CJR_WINDOWS_BY_TERM_MONTHS, REENLISTMENT_RE_CODES, RE_DEFINITION_UNKNOWN, RETENTION_FOOTER, RULE_REFERENCES,
+    STATUS_ELIGIBLE, STATUS_ELIGIBLE_NYSC,
     STATUS_HYT, STATUS_INELIGIBLE, STATUS_INELIGIBLE_WAIVABLE, STATUS_REVIEW,
 )
 from roster_runs.common import INDEFINITE, parse_roster_date
@@ -175,11 +176,37 @@ class TestRun1Cjr:
         assert not any("CJR" in x for x in row["reasons"])
 
     def test_first_termer_in_window(self):
-        # 6-year first-termer, month 64 of 72 -> 6-year window 59-67 (ambiguous 72 checks both).
+        # 6-year first-termer, month 64 of 72 -> 6-year window 56-67 (DAFI 36-2606 Table 3.1; ambiguous 72
+        # checks both). RE 3C = not yet SRP considered -> REVIEW.
         r = run("dos-reenlistment", [first_termer("TESTMIKE, MO", "01-AUG-2021", "31-JUL-2027", re="3C")])
         _, row = where(r, "TESTMIKE, MO")
-        assert "6-year: in window (59-67)" in row["cjr"]
-        assert row["status"] == STATUS_INELIGIBLE_WAIVABLE
+        assert "6-year: in window (56-67)" in row["cjr"]
+        assert row["status"] == STATUS_REVIEW
+        assert any("first-termer not yet SRP considered" in x for x in row["reasons"])
+
+    @pytest.mark.parametrize("doe,month_no,where_text", [
+        # as_of 17-NOV-2026. Table 3.1: 4-year window = months 32-43.
+        ("01-MAY-2024", 31, "before window"),
+        ("01-APR-2024", 32, "in window"),
+        ("01-JAN-2024", 35, "in window"),
+        ("01-MAY-2023", 43, "in window"),
+        ("01-APR-2023", 44, "past window"),
+    ])
+    def test_four_year_cjr_window_is_months_32_to_43(self, doe, month_no, where_text):
+        d, mon, y = doe.split("-")
+        ets = date(int(y) + 4, ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV",
+                                "DEC"].index(mon) + 1, 1) - timedelta(days=1)
+        ets_s = ets.strftime("%d-%b-%Y").upper()
+        r = run("dos-reenlistment", [first_termer("TESTWINDOW, WIN", doe, ets_s, re="1M")],
+                {"dos_window_months": 60})
+        _, row = where(r, "TESTWINDOW, WIN")
+        assert row["month_of_enlistment"] == month_no
+        assert f"4-year: {where_text} (32-43)" in row["cjr"]
+        flagged = any("CJR required to reenlist" in x for x in row["reasons"])
+        assert flagged == (where_text != "before window")
+
+    def test_cjr_windows_match_table_3_1(self):
+        assert CJR_WINDOWS_BY_TERM_MONTHS == {48: (32, 43), 72: (56, 67)}
 
 
 class TestRun1ReCodes:
@@ -192,11 +219,22 @@ class TestRun1ReCodes:
         ("2M", STATUS_INELIGIBLE),
         ("2U", STATUS_HYT),
         ("2V", STATUS_HYT),
-        ("3A", STATUS_INELIGIBLE_WAIVABLE),
-        ("3B", STATUS_INELIGIBLE_WAIVABLE),
-        ("3C", STATUS_INELIGIBLE_WAIVABLE),
+        ("1T", STATUS_ELIGIBLE),
+        ("1S", STATUS_ELIGIBLE),
+        ("2R", STATUS_INELIGIBLE),
+        # Table 5.4: RE-3 = no immediate reenlistment; the waiver is for a later prior-service enlistment.
+        ("3A", STATUS_INELIGIBLE),
+        ("3D", STATUS_INELIGIBLE),
+        ("3I", STATUS_INELIGIBLE),
+        # 3B / 3C: do-not-separate codes awaiting SRP consideration.
+        ("3B", STATUS_REVIEW),
+        ("3C", STATUS_REVIEW),
         ("4D", STATUS_INELIGIBLE),
+        ("4G", STATUS_INELIGIBLE),  # waivable only for RI 9A000-9A300 retrainees
+        ("4I", STATUS_INELIGIBLE),
+        ("4F", STATUS_INELIGIBLE_WAIVABLE),
         ("4K", STATUS_INELIGIBLE_WAIVABLE),
+        ("4N", STATUS_INELIGIBLE_WAIVABLE),
         ("4E", STATUS_INELIGIBLE_WAIVABLE),
         ("9Z", STATUS_REVIEW),
         ("", STATUS_REVIEW),
@@ -215,24 +253,55 @@ class TestRun1ReCodes:
     def test_unknown_code_never_silent_pass(self):
         r = run("dos-reenlistment", [careerist("TESTPAPA, PIA", "15-JUN-2027", re="9Z")])
         _, row = where(r, "TESTPAPA, PIA")
-        assert row["re_definition"] == RE_DEFINITION_UNVERIFIED
-        assert any("not in PACE RE map" in x for x in row["reasons"])
+        assert row["re_definition"] == RE_DEFINITION_UNKNOWN
+        assert any("not in DAFI 36-2606 Tables 5.2-5.5" in x for x in row["reasons"])
 
     def test_waiver_authority(self):
         r = run("dos-reenlistment", [careerist("TESTQUEBEC, QI", "15-JUN-2027", re="4K"),
-                                     careerist("TESTROMEO, RAY", "15-JUN-2027", re="4E")])
-        assert where(r, "TESTQUEBEC, QI")[1]["re_waiver_authority"] == "Unit CC"
-        assert where(r, "TESTROMEO, RAY")[1]["re_waiver_authority"] == "AFPC"
+                                     careerist("TESTROMEO, RAY", "15-JUN-2027", re="4E"),
+                                     careerist("TESTGEE, GEE", "15-JUN-2027", re="4G"),
+                                     careerist("TESTTHREE, TRE", "15-JUN-2027", re="3D")])
+        k = where(r, "TESTQUEBEC, QI")[1]
+        assert k["re_waiver_authority"].startswith("CC/civilian director") and "AF/A1" in k["re_waiver_authority"]
+        assert "Table 5.6 item 2" in k["re_waiver_authority"]
+        e = where(r, "TESTROMEO, RAY")[1]["re_waiver_authority"]
+        assert "group/delta CC" in e and "AFPC/DPPSA" in e and "Table 5.6 item 6" in e
+        g = where(r, "TESTGEE, GEE")[1]
+        assert g["re_waivable"] == "Conditional" and "9A000-9A300" in g["re_waiver_authority"]
+        t = where(r, "TESTTHREE, TRE")[1]
+        assert t["re_waivable"] == "No" and "prior-service enlistment" in t["re_waiver_authority"]
+        assert t["re_class"] == "INELIGIBLE (prior-service enlistment waiver possible)"
 
     def test_3b_cannot_extend(self):
         r = run("dos-reenlistment", [careerist("TESTSIERRA, SUE", "15-JUN-2027", re="3B")])
-        assert where(r, "TESTSIERRA, SUE")[1]["extension_note"] == "RE 3B: cannot extend."
+        note = where(r, "TESTSIERRA, SUE")[1]["extension_note"]
+        assert note.startswith("RE 3B: cannot extend") and "para 6.6.5" in note
 
-    def test_re_map_covers_codes_seen_and_undefined_codes_not_invented(self):
+    def test_2v_cannot_extend(self):
+        r = run("dos-reenlistment", [careerist("TESTVEE, VEE", "15-JUN-2027", re="2V")])
+        assert "para 6.6.5.1.1" in where(r, "TESTVEE, VEE")[1]["extension_note"]
+
+    def test_ineligible_extension_note_and_rule_28c(self):
+        r = run("dos-reenlistment", [careerist("TESTFOURD, FD", "15-JUN-2027", re="4D"),
+                                     careerist("TESTONER, OR", "15-JUN-2027", re="1P")])
+        assert "para 6.6.5.3" in where(r, "TESTFOURD, FD")[1]["extension_note"]
+        ok = where(r, "TESTONER, OR")[1]["extension_note"]
+        assert "Rule 12" in ok and "Rule 13" in ok and "Rule 14" in ok and "Rule 28c" in ok
+
+    def test_re_map_definitions_come_from_the_tables(self):
         for code in "1R 1P 1M 1J 3C 3B 3A 4K 4D 2U 2V 2M".split():
             assert code in REENLISTMENT_RE_CODES
-        assert REENLISTMENT_RE_CODES["1K"]["definition"] == RE_DEFINITION_UNVERIFIED
-        assert REENLISTMENT_RE_CODES["4D"]["definition"] == RE_DEFINITION_UNVERIFIED
+        for code, info in REENLISTMENT_RE_CODES.items():
+            assert "Verify" not in info["definition"], code
+            assert info["citation"].startswith(f"DAFI 36-2606 Table 5.{int(code[0]) + 1} item "), code
+        assert REENLISTMENT_RE_CODES["1K"]["definition"].startswith("Career member selected under the SRP")
+        assert "Table 5.2 item 3" in REENLISTMENT_RE_CODES["1K"]["citation"]
+        assert REENLISTMENT_RE_CODES["4D"]["definition"].startswith("E-4 with 9 to under 16 years TAFMS")
+        assert "13 months or less until DOS" in REENLISTMENT_RE_CODES["2T"]["definition"]
+        assert "more than 13 months until DOS" in REENLISTMENT_RE_CODES["2U"]["definition"]
+        assert "Table 5.6" in REENLISTMENT_RE_CODES["4F"]["citation"]
+        # Table 5.4 items 2-4 have no code in the publication.
+        assert not {"3G", "3H"} & set(REENLISTMENT_RE_CODES)
 
     def test_mel_re_codes_untouched(self):
         assert RE_CODES["4I"] == "Control Roster." and len(RE_CODES) == 17
@@ -246,6 +315,13 @@ class TestRun1HytUif:
         _, row = where(r, "TESTTANGO, TIM")
         assert row["status"] == STATUS_HYT
         assert row["hyt_date"] == date(2027, 3, 15) and row["hyt_basis"] == "computed"
+
+    def test_cmsgt_hyt_uses_dafi_36_3203_30_years(self):
+        r = run("dos-reenlistment", [member("TESTCHIEFH, CH", "CMS", DOE="01-FEB-2021", TAFMSD="10-JAN-1997",
+                                            ETS="31-JAN-2027", DOS="31-JAN-2027", REENL_ELIG_STATUS="1Q")])
+        _, row = where(r, "TESTCHIEFH, CH")
+        assert row["hyt_date"] == date(2027, 1, 10) and "DAFI 36-3203 para 3.10" in row["hyt_basis"]
+        assert row["status"] == STATUS_HYT
 
     def test_uif_disposition_before_dos(self):
         r = run("dos-reenlistment", [careerist("TESTUNIFORM, UMA", "15-JUN-2027", UIF_CODE="1",
@@ -355,7 +431,8 @@ class TestRun2:
         assert short["months_short"] == 1 and short["required_dos_month"] == "MAR-2028"
         assert short["run1_status"] == STATUS_ELIGIBLE  # pulled from Run 1
         assert short["extension_remaining"] == "<= 48 (verify)"
-        assert any("30 days of signing the DEROS Option RIP" in n for n in short["notes"])
+        assert any("30 calendar days of signing the DEROS Option RIP" in n and "para 6.28.4.3" in n
+                   for n in short["notes"])
         assert "Gaining ZZ9GAIN" in short["assignment"]
 
         _, both = where(r, "TESTBOTH, BOB")
@@ -400,10 +477,11 @@ class TestRun3:
         r = run("re-code-review", rows)
         assert [x["name"] for x in r.rows] == ["TESTR2Z, EE", "TESTR4K, BB", "TESTR2X, AA", "TESTR4I, FF"]
         _, k = where(r, "TESTR4K, BB")
-        assert k["re_waivable"] == "Yes" and k["re_waiver_authority"] == "Unit CC"
+        assert k["re_waivable"] == "Yes" and k["re_waiver_authority"].startswith("CC/civilian director")
+        assert k["re_citation"] == "DAFI 36-2606 Table 5.5 item 10; DAFI 36-2606 Table 5.6"
         assert k["uif_code"] == "2" and k["uif_disposition_date"] == date(2027, 3, 1)
         assert k["months_to_dos"] == 1
-        assert where(r, "TESTR2Z, EE")[1]["re_definition"] == RE_DEFINITION_UNVERIFIED
+        assert where(r, "TESTR2Z, EE")[1]["re_definition"] == RE_DEFINITION_UNKNOWN
         assert where(r, "TESTR4I, FF")[1]["dos"] == INDEFINITE
         assert where(r, "TESTR2M, GG")[0] == "data_issue"
         assert r.summary["unknown_codes"] == ["2Z"] and r.summary["officers_excluded"] == 1
@@ -419,6 +497,27 @@ class TestRun3:
 # =============================================================================
 # Exports (pure)
 # =============================================================================
+
+class TestRuleReferences:
+    def test_no_unverified_placeholders_and_current_editions(self):
+        text = " ".join(" ".join(r) for r in RULE_REFERENCES)
+        assert "Verify against the current publication" not in text
+        assert "spec cites" not in text and "DAFI 36-2502" not in text
+        by_rule = {r[1]: r for r in RULE_REFERENCES}
+        assert "Table 5.1 Notes 4-5" in by_rule["Action-by date"][3]
+        assert "(22 May 2024, incl. Change 1, 21 May 2026)" in by_rule["CJR window"][3]
+        assert by_rule["CJR window"][2].startswith("Months 32-43 (4-year) / 56-67 (6-year)")
+        assert "paras 6.2.2" in by_rule["Extension cap"][3]
+        assert "(9 Aug 2024, incl. Change 2, 5 Mar 2026) Table 6.4 Rules 10-11" in by_rule["OS-to-CONUS retainability"][3]
+        assert "paras 6.28.4.7, 7.5.5.1.3" in by_rule["Indefinite DEROS retainability"][3]
+        assert by_rule["BTZ date"][3] == "AFI 36-2502 (2 Jul 2026) para 2.3.1"
+        assert "17 Nov 2026" in by_rule["CBB participation"][3]
+        assert "DAFI 36-3203 (8 Jul 2025) para 3.10" in by_rule["HYT tenure"][3]
+
+    def test_retention_footer_names_editions(self):
+        assert "DAFI 36-2606 (22 May 2024, Chg 1)" in RETENTION_FOOTER
+        assert "DAFI 36-2110 (9 Aug 2024, Chg 2)" in RETENTION_FOOTER
+
 
 class TestExports:
     @pytest.mark.parametrize("run_id", ["dos-reenlistment", "deros-option", "re-code-review"])

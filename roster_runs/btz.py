@@ -2,7 +2,7 @@
 Run 4: SrA Below-the-Zone (BTZ) Quarterly Eligibility Roster.
 
 Pure functions. Scope: RegAF A1C only. Numbers from config/retention.py
-(DAFI 36-2502; the owner's spec cites AFI 36-2502, 26 Sep 2024).
+(AFI 36-2502, 2 Jul 2026, paras 2.2-2.4 and Table 2.7).
 
 Quota eligibles are counted on TIG/TIS only (quality flags are remarks and
 never remove anyone from the count). Previously considered (GSR 5Q) members
@@ -20,6 +20,8 @@ from decimal import ROUND_HALF_UP, Decimal
 from board_filter import pafsc_check
 from config.retention import (
     BTZ_BOARD_OFFSET_MONTHS, BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA, BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA,
+    BTZ_CBB_POLICY_NOTE, BTZ_COMBINE_WITH_LARGE_NOTE, BTZ_QUOTA_COUNT_NOTE, BTZ_ROUNDING_NOTE,
+    BTZ_SINGLE_ELIGIBLE_NOTE,
     BTZ_CONTROL_ROSTER_RE, BTZ_DATE_CITATION, BTZ_FOOTER, BTZ_GSR_STANDING_NOTE,
     BTZ_LARGE_UNIT_THRESHOLD, BTZ_MIN_SKILL_LEVEL, BTZ_MONTHS_EARLY, BTZ_PCS_CITATION,
     BTZ_PREVIOUSLY_CONSIDERED_GSR, BTZ_PRIOR_SERVICE_NOTE, BTZ_PROCESSING_OFFSETS_MONTHS,
@@ -132,11 +134,11 @@ def quarter_options(as_of: date) -> list[dict]:
 
 
 # =============================================================================
-# Quotas (paras 2.3.5-2.3.7)
+# Quotas (AFI 36-2502 paras 2.3.5-2.3.7)
 # =============================================================================
 
 def quota_for(count: int) -> int:
-    """15% rounded half-up: 7-9 = 1, 10-16 = 2, 17-23 = 3, 24-29 = 4, 30-36 = 5."""
+    """15% (para 2.3.5) rounded half-up (PACE rule): 7-9 = 1, 10-16 = 2, 17-23 = 3, 24-29 = 4, 30-36 = 5."""
     value = Decimal(count) * Decimal(BTZ_QUOTA_RATE_PERCENT) / Decimal(100)
     return int(value.quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
@@ -161,20 +163,32 @@ def compute_quotas(unit_counts: dict[str, int], unit_names: dict[str, str], sing
     pool = sum(u["eligible_count"] for u in units if u["size"] == SIZE_SMALL)
     any_large = any(u["size"] == SIZE_LARGE for u in units)
     base_wide = sum(u["eligible_count"] for u in units)
+    combine_with_large = False
     if base_wide == 1:
-        quota, note = None, "Only 1 eligible base-wide: MPF/CC decision, no automatic quota."
+        # para 2.3.5.4
+        quota, note = None, BTZ_SINGLE_ELIGIBLE_NOTE
     elif not any_large and BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA <= pool <= BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA:
+        # para 2.3.5.3
         quota, note = 1, (f"No large units and {BTZ_CBB_MIN_POOL_FOR_ONE_QUOTA}-{BTZ_CBB_MAX_POOL_FOR_ONE_QUOTA} "
-                          "small-unit eligibles: one CBB quota.")
+                          "small-unit eligibles: one CBB quota (AFI 36-2502 para 2.3.5.3).")
+    elif any_large and pool > 0 and quota_for(pool) == 0:
+        # para 2.3.5.2: large unit + small units combine at the CBB
+        quota, note, combine_with_large = None, BTZ_COMBINE_WITH_LARGE_NOTE, True
+        for u in units:
+            if u["size"] == SIZE_LARGE:
+                u["quota_note"] = "Own quota; combines with the small units at the CBB (para 2.3.5.2)"
     else:
         quota = quota_for(pool)
-        note = f"{BTZ_QUOTA_RATE_PERCENT}% of {pool} pooled small-unit eligibles, rounded half-up."
+        note = (f"{BTZ_QUOTA_RATE_PERCENT}% of {pool} pooled small-unit eligibles, rounded half-up "
+                "(AFI 36-2502 para 2.3.5).")
     cbb = {
         "pool_units": pool_units,
         "pool_total": pool,
         "quota": quota,
         "note": note,
         "requires_base_wide_roster": single_unit_roster,
+        "combine_with_large_unit": combine_with_large,
+        "policy_note": BTZ_CBB_POLICY_NOTE,
         "label": CBB_REQUIRES_BASE_WIDE if single_unit_roster else "",
     }
     return units, cbb
@@ -348,10 +362,10 @@ def run_btz_quarterly(records_or_members, as_of: date, params: dict, columns: se
         f"Fully qualified SrA date = earlier of (later of TAFMSD + {BTZ_TIS_MONTHS} months and DOR + "
         f"{BTZ_TIG_WITH_TIS_MONTHS} months) or DOR + {BTZ_TIG_ONLY_MONTHS} months; BTZ date = fully qualified "
         f"date minus {BTZ_MONTHS_EARLY} months ({BTZ_DATE_CITATION}).",
-        "Quota eligibles are counted on TIG/TIS only, regardless of other ineligibility conditions; remarks do "
-        "not remove anyone from the count. Units cannot aggregate above unit level.",
+        BTZ_QUOTA_COUNT_NOTE,
         f"{BTZ_LARGE_UNIT_THRESHOLD} or more eligibles = LARGE unit with its own {BTZ_QUOTA_RATE_PERCENT}% quota; "
-        f"fewer = SMALL unit pooled into the Central Base Board (CBB) ({BTZ_QUOTA_CITATION}).",
+        f"fewer = SMALL unit pooled into the Central Base Board (CBB) ({BTZ_QUOTA_CITATION}). {BTZ_ROUNDING_NOTE}",
+        BTZ_CBB_POLICY_NOTE,
         BTZ_PRIOR_SERVICE_NOTE,
     ]
     if not has_gsr:
