@@ -36,6 +36,7 @@ def error_response(
     message: str,
     context: dict | None = None,
     exception: Exception | None = None,
+    extra: dict | None = None,
 ) -> JSONResponse:
     """
     Log the error with diagnostic context and return a consistent error response.
@@ -45,6 +46,8 @@ def error_response(
         message: Human-readable error message (sent to client)
         context: Dict of diagnostic info (session_id, cycle, filename, step, etc.)
         exception: The caught exception (if any) — logged but NOT sent to client
+        extra: Optional additional JSON fields sent to the client alongside
+            "error" (e.g. {"missing_params": [...]}). Never put row data here.
 
     Returns:
         JSONResponse with consistent error format
@@ -70,8 +73,11 @@ def error_response(
     elif status_code >= 400:
         logger.warning(log_msg)
 
+    content = {"error": message}
+    if extra:
+        content.update({k: v for k, v in extra.items() if k != "error"})
     return JSONResponse(
-        content={"error": message},
+        content=content,
         status_code=status_code,
     )
 

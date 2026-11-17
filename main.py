@@ -18,6 +18,7 @@ from routers.mel import router as mel_router
 from routers.roster import router as roster_router
 from routers.documents import router as documents_router
 from routers.calculators import router as calculators_router
+from routers.rosters import router as rosters_router
 
 
 @asynccontextmanager
@@ -85,6 +86,8 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "X-API-Key"],
+    # Let browser clients read the download filename on export responses.
+    expose_headers=["Content-Disposition"],
 )
 
 from request_logging import RequestLoggingMiddleware
@@ -97,13 +100,21 @@ app.include_router(mel_router, prefix="/api/v1")
 app.include_router(roster_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(calculators_router, prefix="/api/v1")
+app.include_router(rosters_router, prefix="/api/v1")
 
 # Backward-compat: /api/* redirects to /api/v1/*
 from fastapi.responses import RedirectResponse  # noqa: F811
 
 @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE"], include_in_schema=False)
 async def legacy_redirect(request: Request, path: str):
-    """Redirect old /api/ routes to /api/v1/ for backward compatibility."""
+    """Redirect old /api/ routes to /api/v1/ for backward compatibility.
+
+    Only un-versioned legacy paths are redirected. A path that already starts
+    with /api/v1/ and reached this catch-all has no matching v1 route, so it is
+    a genuine 404 (redirecting it would loop: /api/v1/x -> /api/v1/v1/x -> ...).
+    """
+    if path == "v1" or path.startswith("v1/"):
+        return JSONResponse(status_code=404, content={"error": "Not found"})
     new_url = f"/api/v1/{path}"
     if request.query_params:
         new_url += f"?{request.query_params}"

@@ -44,8 +44,15 @@ def validate_file_type(content_type: str) -> None:
         )
 
 
-def ingest_file(contents: bytes, filename: str, logger=None) -> pd.DataFrame:
-    """Parse, validate, and normalize a roster file upload. Raises HTTPException on failure."""
+def ingest_file(contents: bytes, filename: str, logger=None, required_columns=None) -> pd.DataFrame:
+    """Parse, validate, and normalize a roster file upload. Raises HTTPException on failure.
+
+    ``required_columns`` defaults to the promotion-roster REQUIRED_COLUMNS. Callers
+    with a different column contract (e.g. recurring rosters, which resolve header
+    aliases first) pass their own list, or ``[]`` to skip the check here.
+    """
+    if required_columns is None:
+        required_columns = REQUIRED_COLUMNS
     def log(level, msg):
         if logger:
             getattr(logger, level)(msg)
@@ -97,7 +104,7 @@ def ingest_file(contents: bytes, filename: str, logger=None) -> pd.DataFrame:
         )
 
     # Normalize columns
-    df.columns = df.columns.str.strip().str.upper()
+    df.columns = df.columns.astype(str).str.strip().str.upper()
     log("info", "  Normalized column names to uppercase")
 
     # Strip whitespace from string columns
@@ -106,7 +113,7 @@ def ingest_file(contents: bytes, filename: str, logger=None) -> pd.DataFrame:
             df[col] = df[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
 
     # Validate required columns
-    missing = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    missing = [col for col in required_columns if col not in df.columns]
     if missing:
         log("error", f"  FAILED: Missing required columns: {', '.join(missing)}")
         log("info", f"  Available columns: {', '.join(df.columns.tolist())}")

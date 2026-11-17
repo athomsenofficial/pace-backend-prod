@@ -44,6 +44,8 @@ _ROUTE_LABELS = {
     "calculators/promotion-eligibility": "Promotion Calculator",
     "calculators/btz-eligibility": "BTZ Calculator",
     "generate/mfr": "MFR Generator",
+    "rosters": "Recurring Rosters List",
+    "rosters/upload": "Recurring Roster Upload",
 }
 
 
