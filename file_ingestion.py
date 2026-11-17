@@ -121,7 +121,11 @@ def ingest_file(contents: bytes, filename: str, logger=None) -> pd.DataFrame:
 def prepare_session_dataframes(df: pd.DataFrame):
     """Produce (processed_df, pdf_df) for create_session(). Raises HTTPException if PDF columns missing."""
     available_optional = [col for col in OPTIONAL_COLUMNS if col in df.columns]
-    columns_to_keep = REQUIRED_COLUMNS + available_optional
+    # Per-member bookkeeping (stable `_uid`, editor flags) travels with the source roster
+    # so a re-process keeps the reviewer's adds, deletes, edits and overrides.
+    available_meta = [col for col in ('_uid', '_manual', '_override', '_override_reason', 'deleted', 'deletion_reason')
+                      if col in df.columns]
+    columns_to_keep = REQUIRED_COLUMNS + available_optional + available_meta
     processed_df = df[columns_to_keep].copy()
 
     missing_pdf = [col for col in PDF_COLUMNS if col not in processed_df.columns]

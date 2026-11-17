@@ -31,6 +31,49 @@ def format_date_for_display(date_value):
 
     return str(date_value)
 
+# Per-member bookkeeping columns. `_uid` is a stable id that follows a member across
+# categories, edits and re-processing; `_manual` marks a member added in the editor;
+# `_override` / `_override_reason` record a reviewer's "move to eligible" decision;
+# `deleted` / `deletion_reason` mark a soft delete.
+MEMBER_META_COLUMNS = ['_uid', '_manual', '_override', '_override_reason', 'deleted', 'deletion_reason']
+
+# Fields board_filter needs on top of the PDF display columns. Category records keep
+# them so an edit can re-run the filter on the member's full data.
+ELIGIBILITY_EXTRA_COLUMNS = [
+    'PAFSC', 'REENL_ELIG_STATUS', 'UIF_CODE', 'UIF_DISPOSITION_DATE',
+    '2AFSC', '3AFSC', '4AFSC', 'GRADE_PERM_PROJ',
+]
+
+# Fields the add-member form requires; a manually added member is only marked
+# "Missing required data" if one of these is blank.
+MANUAL_REQUIRED_COLUMNS = ['FULL_NAME', 'GRADE', 'DOR', 'TAFMSD', 'PAFSC', 'ASSIGNED_PAS']
+
+CATEGORY_NAMES = ['eligible', 'ineligible', 'discrepancy', 'btz']
+
+# Which category lists a member appears in for each board_filter status.
+# Discrepancy members stay on the eligible list (flagged for review), as on upload.
+STATUS_PLACEMENT = {
+    'eligible': ['eligible'],
+    'discrepancy': ['eligible', 'discrepancy'],
+    'btz': ['btz'],
+    'ineligible': ['ineligible'],
+}
+
+
+def is_truthy(value) -> bool:
+    """True for True/'true'/1, False for None/NaN/False/'' (session JSON round-trips vary)."""
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in ('true', '1', 'yes')
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
 def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
     # Create session-specific logger
     logger = LoggerSetup.get_session_logger(session_id, cycle, year)
@@ -70,11 +113,16 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
     # columns as empty so downstream row['UIF_CODE'] / row['2AFSC'] access stays safe
     # (an absent optional column is equivalent to one full of blank cells).
     present_columns = [col for col in all_roster_columns if col in roster_df.columns]
-    filtered_roster_df = roster_df[present_columns].copy()
+    # Carry per-member bookkeeping (stable id, manual-add / override / soft-delete flags)
+    # through processing so edits survive a re-process.
+    meta_columns = [col for col in MEMBER_META_COLUMNS if col in roster_df.columns]
+    filtered_roster_df = roster_df[present_columns + meta_columns].copy()
     for col in OPTIONAL_COLUMNS:
         if col not in filtered_roster_df.columns:
             filtered_roster_df[col] = None
             logger.info(f"Optional column '{col}' not present in roster; defaulting to empty.")
+    if '_uid' not in filtered_roster_df.columns:
+        filtered_roster_df['_uid'] = [f"u{i}" for i in range(len(filtered_roster_df))]
     logger.info(f"Roster filtered to required columns. Processing {len(filtered_roster_df)} members.")
 
     # Parse all date columns in the DataFrame ONCE, before processing
@@ -94,6 +142,17 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
         member_name = row.get('FULL_NAME', 'Unknown')
         grade = row.get('GRADE', 'Unknown')
 
+        # Removed in the roster editor (soft delete) — stays in the session's source
+        # roster for the audit trail, but is never placed on the MEL again.
+        if is_truthy(row.get('deleted')):
+            continue
+
+        # Members added in the editor were placed deliberately: they skip the
+        # upload-only filters (cycle grade / accounting date / projected grade) that
+        # would otherwise make them silently disappear on a re-process.
+        is_manual = is_truthy(row.get('_manual'))
+        is_override = row.get('_override') == 'eligible'
+
         # Check for officer ranks - skip silently
         if row['GRADE'] in OFFICER_RANKS:
             msg = f"Officer {row['FULL_NAME']} ({row['GRADE']}) excluded from enlisted promotion processing"
@@ -110,22 +169,35 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
         # CRITICAL FIX: Use .get() for optional columns to prevent KeyError
         projected_grade = row.get('GRADE_PERM_PROJ')
 
-        # If projected for next grade (e.g., MSG when cycle is TSG), exclude completely - skip silently
-        if projected_grade == PROMOTIONAL_MAP.get(cycle):
-            continue
-
-        # Check if member should be included in this cycle's roster
-        # Include if: (1) current grade matches cycle OR (2) projected for this cycle
         has_projected_grade = projected_grade == cycle
-        grade_matches_cycle = row['GRADE'] == cycle or (row['GRADE'] == 'A1C' and cycle == 'SRA')
 
-        # Skip if wrong cycle - skip silently
-        if not (grade_matches_cycle or has_projected_grade):
-            continue
+        if not is_manual:
+            # If projected for next grade (e.g., MSG when cycle is TSG), exclude completely - skip silently
+            if projected_grade == PROMOTIONAL_MAP.get(cycle):
+                continue
 
-        # Check accounting date - those who fail should be excluded completely - skip silently
-        valid_member = accounting_date_check(row['DATE_ARRIVED_STATION'], cycle, year, logger=None)
-        if not valid_member:
+            # Check if member should be included in this cycle's roster
+            # Include if: (1) current grade matches cycle OR (2) projected for this cycle
+            grade_matches_cycle = row['GRADE'] == cycle or (row['GRADE'] == 'A1C' and cycle == 'SRA')
+
+            # Skip if wrong cycle - skip silently
+            if not (grade_matches_cycle or has_projected_grade):
+                continue
+
+            # Check accounting date - those who fail should be excluded completely - skip silently
+            valid_member = accounting_date_check(row['DATE_ARRIVED_STATION'], cycle, year, logger=None)
+            if not valid_member:
+                continue
+
+        # Reviewer moved this member to eligible ("Move to Eligible" in the editor).
+        # Honour that decision on every re-process.
+        if is_override:
+            if row['ASSIGNED_PAS'] not in pascodes:
+                pascodes.append(row['ASSIGNED_PAS'])
+                pascode_unit_map[row['ASSIGNED_PAS']] = row['ASSIGNED_PAS_CLEARTEXT']
+            eligible_service_members.append(index)
+            unit_total_map[row['ASSIGNED_PAS']] = unit_total_map.get(row['ASSIGNED_PAS'], 0) + 1
+            logger.info(f"ROW {index}: {mask_name(member_name)} — ELIGIBLE by reviewer override")
             continue
 
         # ONLY log members that will appear on the roster (passed all initial filters)
@@ -140,8 +212,8 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
 
         # Check for missing required data
         missing_required = False
-        for column in REQUIRED_COLUMNS:
-            if column in row and pd.isna(row[column]):
+        for column in (MANUAL_REQUIRED_COLUMNS if is_manual else REQUIRED_COLUMNS):
+            if column in row and (pd.isna(row[column]) or (isinstance(row[column], str) and not row[column].strip())):
                 error_log.append(f"Missing required data at row {index}, column {column}")
                 logger.warning(f"  ❌ Missing required column: {column}")
                 missing_required = True
@@ -160,7 +232,7 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
         # SrA pin by board_filter (eligible / ineligible / BTZ / skip), regardless of
         # whether GRADE_PERM_PROJ is populated, so they must NOT be short-circuited here.
         a1c_in_sra_cycle = row['GRADE'] == 'A1C' and cycle == 'SRA'
-        if has_projected_grade and not a1c_in_sra_cycle:
+        if has_projected_grade and not a1c_in_sra_cycle and not is_manual:
             ineligible_service_members.append(index)
             reason_for_ineligible_map[index] = f'Projected for {cycle}.'
             logger.info(f"  ❌ INELIGIBLE: Already projected for {cycle}")
@@ -180,7 +252,14 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
                                      row['PAFSC'], row['2AFSC'], row['3AFSC'], row['4AFSC'],
                                      member_name=member_name, roster_type=roster_type, logger=logger)
 
-        if member_status.status == "skip":
+        if member_status.status == "skip" and is_manual:
+            # A deliberately added member never silently disappears — show them as
+            # ineligible with the filter's reason so the reviewer can see why.
+            ineligible_service_members.append(index)
+            reason_for_ineligible_map[index] = member_status.reason or 'Does not meet eligibility criteria for this cycle'
+            logger.info(f"  Decision: Manually added member marked ineligible (board_filter skip)")
+
+        elif member_status.status == "skip":
             logger.info(f"  Decision: Not eligible (skipped by board_filter)")
             continue
 
@@ -217,7 +296,15 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
     pascodes = sorted(pascodes)
 
     # Create PDF DataFrames with parsed datetime objects
-    pdf_roster = filtered_roster_df[PDF_COLUMNS].copy()
+    # Keep the eligibility fields and bookkeeping columns alongside the display
+    # columns: re-checking a member after an edit needs PAFSC / RE / UIF / AFSCs, and
+    # `_uid` lets edits and deletes follow the member across categories. The PDF
+    # generators select display columns only (pdf_utils.clean_dataframe).
+    keep_columns = PDF_COLUMNS + [
+        col for col in ELIGIBILITY_EXTRA_COLUMNS + MEMBER_META_COLUMNS
+        if col in filtered_roster_df.columns and col not in PDF_COLUMNS
+    ]
+    pdf_roster = filtered_roster_df[keep_columns].copy()
 
     eligible_df = pdf_roster.loc[eligible_service_members].copy() if eligible_service_members else pd.DataFrame()
     ineligible_df = pdf_roster.loc[ineligible_service_members].copy() if ineligible_service_members else pd.DataFrame()
@@ -236,7 +323,7 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
         df_copy = df.copy()
 
         # Format date columns for display ONLY
-        date_columns = ['DOR', 'TAFMSD', 'DATE_ARRIVED_STATION']
+        date_columns = ['DOR', 'TAFMSD', 'DATE_ARRIVED_STATION', 'UIF_DISPOSITION_DATE']
         for col in date_columns:
             if col in df_copy.columns:
                 df_copy[col] = df_copy[col].apply(format_date_for_display)
@@ -315,22 +402,18 @@ def roster_processor(roster_df, session_id, cycle, year, roster_type="mel"):
     return
 
 
-def recheck_member_eligibility(session_id: str, member_data: dict, source_category: str, source_index: int):
+def evaluate_member(member_data: dict, cycle: str, year):
     """
-    Re-run board_filter on a single member after edit/add.
-    Moves the member to the correct category based on the result.
-    Returns the new category name.
+    Run board_filter on one member record (as stored in the session) and return
+    (status, reason) where status is one of eligible / discrepancy / btz / ineligible.
+
+    A reviewer override ("Move to Eligible") wins over the filter.
     """
-    session = get_session(session_id)
-    if not session:
-        return source_category
+    if member_data.get('_override') == 'eligible':
+        return 'eligible', None
 
-    cycle = session.get('cycle', 'SSG')
-    year = session.get('year', 2025)
-
-    # Run board_filter on this member. Dates may arrive as strings (manual add/edit
-    # from the UI) or as datetimes (already-parsed roster rows) — parse_date handles
-    # both and returns tz-naive datetimes, which board_filter's comparisons require.
+    # Dates may arrive as strings (manual add/edit from the UI) or as datetimes —
+    # parse_date handles both and returns tz-naive datetimes, which board_filter needs.
     result = board_filter(
         grade=member_data.get('GRADE', ''),
         year=year,
@@ -346,103 +429,100 @@ def recheck_member_eligibility(session_id: str, member_data: dict, source_catego
         member_name=member_data.get('FULL_NAME', 'Unknown'),
         roster_type='mel',
     )
+    status = result.status
+    if status == 'skip':
+        return 'ineligible', result.reason or 'Does not meet eligibility criteria for this cycle'
+    if status not in STATUS_PLACEMENT:
+        return 'ineligible', result.reason
+    return status, result.reason
 
-    # Map board_filter result to category
-    status_to_category = {
-        'eligible': 'eligible',
-        'ineligible': 'ineligible',
-        'btz': 'btz',
-        'discrepancy': 'discrepancy',
-        'skip': 'ineligible',
-    }
-    new_category = status_to_category.get(result.status, 'ineligible')
 
-    # If the category didn't change, nothing to do
-    if new_category == source_category:
-        # Still update reason if applicable
-        if result.reason and new_category in ('ineligible', 'discrepancy'):
-            member_data['REASON'] = result.reason
-            cat_list = session.get(f'{source_category}_df', [])
-            if isinstance(cat_list, list) and source_index < len(cat_list):
-                cat_list[source_index]['REASON'] = result.reason
-                update_session(session_id, **{f'{source_category}_df': pd.DataFrame(cat_list)})
-        return new_category
+def place_member(session_id: str, member_data: dict, source_category: str = None,
+                 source_index: int = None, status: str = None, reason: str = None):
+    """
+    Put one member in the right category lists, replacing every existing copy.
 
-    # Category changed — remove from old, add to new
-    old_key = f'{source_category}_df'
-    new_key = f'{new_category}_df'
+    The member is located by `_uid` in every category (a discrepancy member lives in
+    both eligible and discrepancy), or — for records without a `_uid` — by
+    (source_category, source_index). If `status` is not given, board_filter decides.
+    Returns the member's primary category.
+    """
+    session = get_session(session_id)
+    if not session:
+        return source_category
 
-    old_list = session.get(old_key, [])
-    new_list = session.get(new_key, [])
+    if status is None:
+        status, reason = evaluate_member(member_data, session.get('cycle', 'SSG'), session.get('year', 2025))
 
-    if isinstance(old_list, list) and source_index < len(old_list):
-        # Remove from old category
-        moved_member = old_list.pop(source_index)
-    else:
-        moved_member = member_data.copy()
+    lists = {}
+    for name in CATEGORY_NAMES:
+        current = session.get(f'{name}_df', [])
+        lists[name] = list(current) if isinstance(current, list) else []
 
-    # Add reason if ineligible/discrepancy
-    if result.reason and new_category in ('ineligible', 'discrepancy'):
-        moved_member['REASON'] = result.reason
-    elif 'REASON' in moved_member and new_category in ('eligible', 'btz'):
-        del moved_member['REASON']
+    uid = member_data.get('_uid')
+    if uid:
+        for name in CATEGORY_NAMES:
+            lists[name] = [m for m in lists[name] if m.get('_uid') != uid]
+    elif source_category in lists and source_index is not None and 0 <= source_index < len(lists[source_category]):
+        lists[source_category].pop(source_index)
 
-    if not isinstance(new_list, list):
-        new_list = []
-    new_list.append(moved_member)
+    base = {k: v for k, v in member_data.items() if k not in ('REASON', 'reason', 'member_id')}
+    for name in STATUS_PLACEMENT.get(status, ['ineligible']):
+        record = dict(base)
+        if name in ('ineligible', 'discrepancy'):
+            record['REASON'] = reason or 'Manual review required'
+        lists[name].append(record)
 
-    updates = {
-        old_key: pd.DataFrame(old_list) if old_list else pd.DataFrame(),
-        new_key: pd.DataFrame(new_list),
-        'edited': True,
-    }
-    update_session(session_id, **updates)
+    update_session(session_id, edited=True,
+                   **{f'{name}_df': pd.DataFrame(lists[name]) for name in CATEGORY_NAMES})
+    return status
 
-    return new_category
+
+def recheck_member_eligibility(session_id: str, member_data: dict, source_category: str, source_index: int):
+    """
+    Re-run board_filter on a single member after edit/add and move the member to the
+    correct categories. Returns the new primary category name.
+    """
+    return place_member(session_id, member_data, source_category, source_index)
 
 
 def recalculate_small_units(session_id):
     """
     Recalculate small_unit_df after add/edit/delete operations.
-    This ensures senior_rater_needed flag is correctly set based on current data.
+    Counts the same members the upload counts (eligible incl. discrepancy, plus BTZ),
+    ignoring soft-deleted members.
     """
     session = get_session(session_id)
     if not session:
         return
 
     cycle = session.get('cycle', 'SSG')
-    eligible_df = session.get('eligible_df', pd.DataFrame())
 
-    # Convert to DataFrame if it's a list
-    if isinstance(eligible_df, list):
-        eligible_df = pd.DataFrame(eligible_df)
+    def live(records):
+        if not isinstance(records, list):
+            return []
+        return [m for m in records if not is_truthy(m.get('deleted'))]
 
-    # If no eligible members, clear small_unit_df
-    if eligible_df.empty:
+    eligible = live(session.get('eligible_df', []))
+    btz = live(session.get('btz_df', []))
+
+    if not eligible:
         update_session(session_id, small_unit_df=pd.DataFrame())
         return
 
-    # Count eligible members per pascode (vectorized)
-    unit_total_map = eligible_df.groupby('ASSIGNED_PAS').size().to_dict()
+    unit_total_map = {}
+    for m in eligible + btz:
+        pas = m.get('ASSIGNED_PAS')
+        if pas:
+            unit_total_map[pas] = unit_total_map.get(pas, 0) + 1
 
-    # Determine which pascodes are small units
-    small_unit_pascodes = []
-    for pascode in unit_total_map:
-        if cycle == 'MSG' or cycle == 'SMS':
-            # MSG and SMS cycles: all units are small units
-            small_unit_pascodes.append(pascode)
-        elif unit_total_map[pascode] <= small_unit_threshold:
-            # Other cycles: units with <= threshold eligible members
-            small_unit_pascodes.append(pascode)
+    small_unit_pascodes = {
+        pas for pas, total in unit_total_map.items()
+        if cycle in ('MSG', 'SMS') or total <= small_unit_threshold
+    }
 
-    # Extract small unit members from eligible_df
-    if small_unit_pascodes:
-        small_unit_df = eligible_df[eligible_df['ASSIGNED_PAS'].isin(small_unit_pascodes)].copy()
-    else:
-        small_unit_df = pd.DataFrame()
-
-    # Update session with the recalculated small_unit_df
-    update_session(session_id, small_unit_df=small_unit_df)
+    small_unit = [m for m in eligible if m.get('ASSIGNED_PAS') in small_unit_pascodes]
+    update_session(session_id, small_unit_df=pd.DataFrame(small_unit) if small_unit else pd.DataFrame())
 
 def rescan_and_update_pascodes(session_id: str):
     """

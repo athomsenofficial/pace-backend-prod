@@ -1,12 +1,17 @@
 import asyncio
 import io
+import uuid
 from fastapi import APIRouter, Body, Query, UploadFile, File
 from error_handling import error_response
 from fastapi.responses import JSONResponse, StreamingResponse
 import pandas as pd
 from typing import Dict, Optional
 from session_manager import get_session, update_session
-from roster_processor import roster_processor, recalculate_small_units, rescan_and_update_pascodes, recheck_member_eligibility
+from roster_processor import (
+    roster_processor, recalculate_small_units, rescan_and_update_pascodes,
+    place_member, is_truthy, format_date_for_display,
+)
+from date_parsing import parse_date
 from constants import PDF_COLUMNS
 
 router = APIRouter(tags=["Roster"])
@@ -52,7 +57,7 @@ def get_roster_preview(
 
             cleaned_records = []
             for idx, record in enumerate(records):
-                if record.get('deleted', False):
+                if is_truthy(record.get('deleted', False)):
                     continue
 
                 clean_record = {k: v for k, v in record.items()
@@ -70,6 +75,11 @@ def get_roster_preview(
                 # `reason` key the frontend reads (the stored column is `REASON`).
                 reason_val = record.get('REASON') or record.get('reason')
                 clean_record['reason'] = reason_val if reason_val else None
+
+                # Editor state the UI shows as badges.
+                clean_record['override'] = record.get('_override') == 'eligible'
+                clean_record['override_reason'] = record.get('_override_reason') if clean_record['override'] else None
+                clean_record['manual'] = is_truthy(record.get('_manual'))
 
                 cleaned_records.append(clean_record)
 
@@ -96,10 +106,11 @@ def get_roster_preview(
 
         statistics = {
             "total_uploaded": len(total_uploaded_list),
+            # Discrepancy members are also on the eligible list, so they are not
+            # added again here (each member counts once).
             "total_processed": (
                 len(eligible_list) +
                 len(ineligible_list) +
-                len(discrepancy_list) +
                 len(btz_list)
             ),
             "eligible": len(eligible_list),
@@ -176,6 +187,94 @@ def get_roster_preview(
         return error_response(500, "Failed to retrieve roster preview", context={"session_id": session_id}, exception=e)
 
 
+# Fields a reviewer may set on a member from the editor (edit / add). Anything else in
+# a request body is ignored.
+EDITABLE_FIELDS = [
+    'FULL_NAME', 'GRADE', 'DOR', 'TAFMSD', 'DATE_ARRIVED_STATION',
+    'UIF_CODE', 'UIF_DISPOSITION_DATE', 'REENL_ELIG_STATUS', 'PAFSC',
+    '2AFSC', '3AFSC', '4AFSC', 'ASSIGNED_PAS', 'ASSIGNED_PAS_CLEARTEXT',
+    'DAFSC', 'GRADE_PERM_PROJ', 'SSAN',
+]
+
+
+def _parse_member_id(member_id: str):
+    """'row_<category>_<index>' -> (category, index). Raises ValueError if malformed."""
+    parts = member_id.split('_')
+    if len(parts) < 3 or parts[0] != 'row':
+        raise ValueError(member_id)
+    index = int(parts[-1])
+    category = '_'.join(parts[1:-1])  # small_unit contains an underscore
+    return category, index
+
+
+def _locate_member(session_id: str, session: dict, member_id: str):
+    """
+    Resolve a preview member_id to (category, index, record).
+    Returns an error JSONResponse instead when the id is bad.
+    """
+    try:
+        category, index = _parse_member_id(member_id)
+    except (ValueError, IndexError):
+        return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
+
+    if category not in VALID_CATEGORIES:
+        return error_response(400, f"Invalid category: {category}", context={"session_id": session_id})
+
+    data_list = session.get(f"{category}_df", [])
+    if not isinstance(data_list, list):
+        return error_response(404, f"Category {category} not found", context={"session_id": session_id, "category": category})
+    if index >= len(data_list):
+        return error_response(404, f"Member index {index} out of range for category {category}", context={"session_id": session_id, "index": index, "category": category})
+
+    return category, index, dict(data_list[index])
+
+
+DATE_FIELDS = {'DOR', 'TAFMSD', 'DATE_ARRIVED_STATION', 'UIF_DISPOSITION_DATE'}
+
+
+def _clean_value(value, field: str = None):
+    """
+    Trim strings and turn blanks into None so required-field checks work. Dates are
+    stored in the roster's display format (DD-MMM-YYYY) whatever format the UI sent,
+    so the PDF never mixes 2024-01-01 and 01-JAN-2024.
+    """
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    if field in DATE_FIELDS and value is not None:
+        parsed = parse_date(value)
+        return format_date_for_display(parsed) if parsed else value
+    return value
+
+
+def _update_source_roster(session: dict, uid: str, updates: dict = None, remove: bool = False, append: dict = None):
+    """
+    Apply an editor change to the session's source roster ('dataframe'), which a
+    re-process rebuilds every category from. Returns the new list.
+    """
+    rows = session.get('dataframe', [])
+    rows = list(rows) if isinstance(rows, list) else []
+    if append is not None:
+        rows.append(append)
+        return rows
+    if not uid:
+        return rows
+    out = []
+    for row in rows:
+        if row.get('_uid') == uid:
+            if remove:
+                continue
+            row = {**row, **(updates or {})}
+        out.append(row)
+    return out
+
+
+def _refresh_derived(session_id: str):
+    rescan_and_update_pascodes(session_id)
+    recalculate_small_units(session_id)
+
+
 @router.put("/roster/member/{session_id}/{member_id}")
 async def edit_roster_member(session_id: str, member_id: str, member_data: Dict):
     """Edit an existing member in the roster."""
@@ -188,65 +287,29 @@ def _edit_roster_member_sync(session_id: str, member_id: str, member_data: Dict)
         if not session:
             return error_response(404, "Session not found or expired", context={"session_id": session_id})
 
-        try:
-            parts = member_id.split('_')
-            if len(parts) >= 3 and parts[0] == 'row':
-                category_name = parts[1]
-                index = int(parts[2])
-                category_key = f"{category_name}_df"
-            else:
-                return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
-        except (ValueError, IndexError):
-            return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
+        located = _locate_member(session_id, session, member_id)
+        if not isinstance(located, tuple):
+            return located
+        category_name, index, member = located
 
-        if category_name not in VALID_CATEGORIES:
-            return error_response(400, f"Invalid category: {category_name}", context={"session_id": session_id})
+        updates = {k: _clean_value(v, k) for k, v in member_data.items() if k in EDITABLE_FIELDS}
+        member.update(updates)
 
-        data_list = session.get(category_key, [])
+        uid = member.get('_uid')
+        if uid:
+            update_session(session_id, dataframe=pd.DataFrame(_update_source_roster(session, uid, updates=updates)))
 
-        if not isinstance(data_list, list):
-            return error_response(404, f"Category {category_name} not found", context={"session_id": session_id, "category": category_name})
+        # small_unit is a derived view of eligible: re-place from the eligible copy.
+        source_category = 'eligible' if category_name == 'small_unit' else category_name
+        new_category = place_member(session_id, member, source_category, index if category_name != 'small_unit' else None)
 
-        if index >= len(data_list):
-            return error_response(404, f"Member index {index} out of range for category {category_name}", context={"session_id": session_id, "index": index, "category": category_name})
-
-        original_member = dict(data_list[index])
-
-        filtered_updates = {}
-        for key, value in member_data.items():
-            if key in data_list[index]:
-                filtered_updates[key] = value
-
-        data_list[index].update(filtered_updates)
-
-        pdf_list = session.get('pdf_dataframe', [])
-        if isinstance(pdf_list, list):
-            for i, pdf_member in enumerate(pdf_list):
-                if (pdf_member.get('FULL_NAME') == original_member.get('FULL_NAME') and
-                    pdf_member.get('SSAN') == original_member.get('SSAN')):
-                    for key, value in filtered_updates.items():
-                        if key in pdf_list[i]:
-                            pdf_list[i][key] = value
-                    break
-
-        updates = {
-            category_key: pd.DataFrame(data_list),
-            'pdf_dataframe': pd.DataFrame(pdf_list) if pdf_list else pd.DataFrame(),
-            'edited': True
-        }
-        update_session(session_id, **updates)
-
-        # Re-check eligibility — member may need to move categories
-        new_category = recheck_member_eligibility(session_id, data_list[index], category_name, index)
-
-        rescan_and_update_pascodes(session_id)
-        recalculate_small_units(session_id)
+        _refresh_derived(session_id)
 
         return JSONResponse(content={
             "success": True,
             "message": "Member updated successfully",
             "member_id": member_id,
-            "category_changed": new_category != category_name,
+            "category_changed": new_category != source_category,
             "new_category": new_category,
         })
 
@@ -271,65 +334,43 @@ def _delete_roster_member_sync(session_id, member_id, reason, hard_delete):
         if not session:
             return error_response(404, "Session not found or expired", context={"session_id": session_id})
 
-        if not reason:
+        if not reason or not reason.strip():
             return error_response(400, "Reason for deletion is required", context={"session_id": session_id, "member_id": member_id})
 
-        try:
-            parts = member_id.split('_')
-            if len(parts) >= 3 and parts[0] == 'row':
-                category_name = parts[1]
-                index = int(parts[2])
-                category_key = f"{category_name}_df"
+        located = _locate_member(session_id, session, member_id)
+        if not isinstance(located, tuple):
+            return located
+        category_name, index, member = located
+        uid = member.get('_uid')
+
+        updates = {}
+        for name in ('eligible', 'ineligible', 'discrepancy', 'btz', 'small_unit'):
+            records = session.get(f'{name}_df', [])
+            if not isinstance(records, list):
+                continue
+            new_records = []
+            for i, record in enumerate(records):
+                same = (record.get('_uid') == uid) if uid else (name == category_name and i == index)
+                if not same:
+                    new_records.append(record)
+                elif not hard_delete:
+                    new_records.append({**record, 'deleted': True, 'deletion_reason': reason})
+                # hard delete: drop the record entirely
+            updates[f'{name}_df'] = pd.DataFrame(new_records) if new_records else pd.DataFrame()
+
+        if uid:
+            if hard_delete:
+                updates['dataframe'] = pd.DataFrame(_update_source_roster(session, uid, remove=True))
             else:
-                return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
-        except (ValueError, IndexError):
-            return error_response(400, f"Invalid member_id format: {member_id}", context={"session_id": session_id, "member_id": member_id})
+                updates['dataframe'] = pd.DataFrame(_update_source_roster(
+                    session, uid, updates={'deleted': True, 'deletion_reason': reason}))
 
-        if category_name not in VALID_CATEGORIES:
-            return error_response(400, f"Invalid category: {category_name}", context={"session_id": session_id})
-
-        data_list = session.get(category_key, [])
-
-        if not isinstance(data_list, list):
-            return error_response(404, f"Category {category_name} not found", context={"session_id": session_id, "category": category_name})
-
-        if index >= len(data_list):
-            return error_response(404, f"Member index {index} out of range for category {category_name}", context={"session_id": session_id, "index": index, "category": category_name})
-
-        # Capture member data BEFORE mutation for pdf_dataframe lookup
-        deleted_member = dict(data_list[index])
-
-        if hard_delete:
-            data_list.pop(index)
-        else:
-            data_list[index]['deleted'] = True
-            data_list[index]['deletion_reason'] = reason
-
-        pdf_list = session.get('pdf_dataframe', [])
-        if isinstance(pdf_list, list):
-            for i, pdf_member in enumerate(pdf_list):
-                if (pdf_member.get('FULL_NAME') == deleted_member.get('FULL_NAME') and
-                    pdf_member.get('SSAN') == deleted_member.get('SSAN')):
-                    if hard_delete:
-                        pdf_list.pop(i)
-                    else:
-                        pdf_list[i]['deleted'] = True
-                        pdf_list[i]['deletion_reason'] = reason
-                    break
-
-        updates = {
-            category_key: pd.DataFrame(data_list) if data_list else pd.DataFrame(),
-            'pdf_dataframe': pd.DataFrame(pdf_list) if pdf_list else pd.DataFrame(),
-            'edited': True
-        }
-
-        update_session(session_id, **updates)
-        rescan_and_update_pascodes(session_id)
-        recalculate_small_units(session_id)
+        update_session(session_id, edited=True, **updates)
+        _refresh_derived(session_id)
 
         return JSONResponse(content={
             "success": True,
-            "message": f"Member {'permanently deleted' if hard_delete else 'marked as deleted'} successfully from {category_name}",
+            "message": f"Member {'permanently deleted' if hard_delete else 'removed'} successfully",
             "member_id": member_id,
             "category": category_name,
             "reason": reason,
@@ -346,151 +387,138 @@ async def add_roster_member(session_id: str, data: Dict):
     return await asyncio.to_thread(_add_roster_member_sync, session_id, data)
 
 def _add_roster_member_sync(session_id, data):
+    category = data.get('category', 'eligible') if isinstance(data, dict) else 'eligible'
     try:
         session = get_session(session_id)
 
         if not session:
             return error_response(404, "Session not found or expired", context={"session_id": session_id})
 
-        category = data.get('category', 'eligible')
-        member_data = data.get('data', {})
-        reason = data.get('reason', '')
+        member_data = data.get('data', {}) or {}
+        reason = (data.get('reason') or '').strip()
         run_eligibility_check = data.get('run_eligibility_check', True)
-        senior_rater_info = data.get('senior_rater_info', {})
+        senior_rater_info = data.get('senior_rater_info', {}) or {}
 
-        if category not in VALID_CATEGORIES:
+        if category not in VALID_CATEGORIES or category == 'small_unit':
             return error_response(400, f"Invalid category: {category}", context={"session_id": session_id})
 
         if not reason:
             return error_response(400, "Reason for adding member is required", context={"session_id": session_id, "category": category})
 
-        category_key = f"{category}_df"
-        category_list = session.get(category_key, [])
-
-        if not isinstance(category_list, list):
-            category_list = []
-
-        if category_list and len(category_list) > 0:
-            template = category_list[0]
-            new_member = {}
-
-            for key in template.keys():
-                if key in member_data:
-                    new_member[key] = member_data[key]
-                elif key == 'REASON' and category in ['ineligible', 'discrepancy']:
-                    new_member[key] = reason
-                elif key == 'member_id':
-                    continue
-                else:
-                    new_member[key] = template.get(key, '')
-        else:
-            new_member = {}
-            for col in PDF_COLUMNS:
-                if col in member_data:
-                    new_member[col] = member_data[col]
-            if 'PAFSC' in member_data:
-                new_member['PAFSC'] = member_data['PAFSC']
-
-            if category in ['ineligible', 'discrepancy'] and 'REASON' not in new_member:
-                new_member['REASON'] = reason
-
-        # Ensure ALL eligibility-relevant fields from the submitted data are present
-        # on the new member, even when the category template only carries display
-        # (PDF) columns. Without this, board_filter receives None for PAFSC / UIF /
-        # REENL / AFSC and misclassifies the member — the "always placed in eligible"
-        # bug. With the full data present, recheck_member_eligibility (below) runs the
-        # same board_filter the initial upload uses and routes them to the right bucket.
-        ELIGIBILITY_FIELDS = [
-            'FULL_NAME', 'GRADE', 'DOR', 'TAFMSD', 'DATE_ARRIVED_STATION',
-            'UIF_CODE', 'UIF_DISPOSITION_DATE', 'REENL_ELIG_STATUS', 'PAFSC',
-            '2AFSC', '3AFSC', '4AFSC', 'ASSIGNED_PAS', 'ASSIGNED_PAS_CLEARTEXT',
-            'DAFSC', 'GRADE_PERM_PROJ',
-        ]
-        for fld in ELIGIBILITY_FIELDS:
+        # Build the member from the submitted fields only. (The old code copied missing
+        # fields from another member on the roster, which leaked their data.)
+        new_member = {col: None for col in PDF_COLUMNS}
+        for fld in EDITABLE_FIELDS:
             if fld in member_data:
-                new_member[fld] = member_data[fld]
+                new_member[fld] = _clean_value(member_data[fld], fld)
+        missing = [f for f in ('FULL_NAME', 'GRADE', 'ASSIGNED_PAS') if not new_member.get(f)]
+        if missing:
+            return error_response(400, f"Missing required fields: {', '.join(missing)}", context={"session_id": session_id})
 
-        if category == 'eligible':
-            if not reason.lower().startswith('manual add'):
-                reason = f"Manual add: {reason}"
+        new_member['_uid'] = f"m{uuid.uuid4().hex[:12]}"
+        new_member['_manual'] = True
 
-        new_index = len(category_list)
-        new_member['member_id'] = f"row_{category}_{new_index}"
-
-        # Accumulate all updates into a single dict for one update_session call
         batched_updates = {
-            'edited': True
+            'edited': True,
+            'dataframe': pd.DataFrame(_update_source_roster(session, None, append=dict(new_member))),
         }
 
-        if 'ASSIGNED_PAS' in new_member:
-            new_pascode = new_member['ASSIGNED_PAS']
-            existing_pascodes = session.get('pascodes', [])
+        new_pascode = new_member.get('ASSIGNED_PAS')
+        if senior_rater_info and new_pascode:
+            pascode_map = session.get('pascode_map', {}) or {}
+            pascode_map[new_pascode] = {
+                'srid': senior_rater_info.get('SRID', ''),
+                'senior_rater_name': senior_rater_info.get('SENIOR_RATER_NAME', ''),
+                'senior_rater_rank': senior_rater_info.get('SENIOR_RATER_RANK', ''),
+                'senior_rater_title': senior_rater_info.get('SENIOR_RATER_TITLE', ''),
+                'pascode': new_pascode,
+                'unit_name': new_member.get('ASSIGNED_PAS_CLEARTEXT', '')
+            }
+            batched_updates["pascode_map"] = pascode_map
 
-            if new_pascode and new_pascode not in existing_pascodes:
-                existing_pascodes.append(new_pascode)
-                batched_updates["pascodes"] = existing_pascodes
-
-            if 'ASSIGNED_PAS_CLEARTEXT' in new_member:
-                pascode_unit_map = session.get('pascode_unit_map', {})
-                pascode_unit_map[new_pascode] = new_member['ASSIGNED_PAS_CLEARTEXT']
-                batched_updates["pascode_unit_map"] = pascode_unit_map
-
-            if senior_rater_info and new_pascode:
-                pascode_map = session.get('pascode_map', {})
-                pascode_map[new_pascode] = {
-                    'srid': senior_rater_info.get('SRID', ''),
-                    'senior_rater_name': senior_rater_info.get('SENIOR_RATER_NAME', ''),
-                    'senior_rater_rank': senior_rater_info.get('SENIOR_RATER_RANK', ''),
-                    'senior_rater_title': senior_rater_info.get('SENIOR_RATER_TITLE', ''),
-                    'pascode': new_pascode,
-                    'unit_name': new_member.get('ASSIGNED_PAS_CLEARTEXT', '')
-                }
-                batched_updates["pascode_map"] = pascode_map
-
-        if senior_rater_info and senior_rater_info.get('SRID'):
-            small_unit_sr = session.get('small_unit_sr', {})
-            if not small_unit_sr:
-                small_unit_sr = {
-                    'srid': senior_rater_info.get('SRID', ''),
-                    'senior_rater_name': senior_rater_info.get('SENIOR_RATER_NAME', ''),
-                    'senior_rater_rank': senior_rater_info.get('SENIOR_RATER_RANK', ''),
-                    'senior_rater_title': senior_rater_info.get('SENIOR_RATER_TITLE', '')
-                }
-                batched_updates["small_unit_sr"] = small_unit_sr
-
-        category_list.append(new_member)
-        batched_updates[category_key] = pd.DataFrame(category_list)
-
-        pdf_list = session.get('pdf_dataframe', [])
-        if isinstance(pdf_list, list):
-            pdf_new_member = new_member.copy()
-            pdf_new_member.pop('member_id', None)
-            pdf_list.append(pdf_new_member)
-            batched_updates["pdf_dataframe"] = pd.DataFrame(pdf_list)
+        if senior_rater_info and senior_rater_info.get('SRID') and not session.get('small_unit_sr'):
+            batched_updates["small_unit_sr"] = {
+                'srid': senior_rater_info.get('SRID', ''),
+                'senior_rater_name': senior_rater_info.get('SENIOR_RATER_NAME', ''),
+                'senior_rater_rank': senior_rater_info.get('SENIOR_RATER_RANK', ''),
+                'senior_rater_title': senior_rater_info.get('SENIOR_RATER_TITLE', '')
+            }
 
         update_session(session_id, **batched_updates)
 
-        # Re-check eligibility — member may belong in a different category
+        # Same board_filter the upload uses decides where the member goes.
         if run_eligibility_check:
-            new_category = recheck_member_eligibility(
-                session_id, new_member, category, len(category_list) - 1
-            )
+            new_category = place_member(session_id, new_member)
         else:
-            new_category = category
+            new_category = place_member(session_id, new_member, status=category,
+                                        reason=reason if category in ('ineligible', 'discrepancy') else None)
 
-        rescan_and_update_pascodes(session_id)
-        recalculate_small_units(session_id)
+        _refresh_derived(session_id)
 
         return JSONResponse(content={
             "success": True,
             "message": "Member added successfully",
-            "member_id": new_member.get('member_id'),
+            "member_uid": new_member['_uid'],
             "category": new_category,
             "category_changed": new_category != category,
         })
 
     except Exception as e:
         return error_response(500, "Failed to add member", context={"session_id": session_id, "category": category}, exception=e)
+
+
+@router.post("/roster/member/{session_id}/{member_id}/move-to-eligible")
+async def move_member_to_eligible(session_id: str, member_id: str, data: Dict = Body(default=None)):
+    """
+    Reviewer override: put an ineligible / discrepancy member on the eligible list
+    (e.g. the roster data is wrong). Requires a reason; the decision is kept through
+    later edits and re-processing until it is undone.
+    """
+    return await asyncio.to_thread(_override_member_sync, session_id, member_id, (data or {}).get('reason', ''), True)
+
+
+@router.post("/roster/member/{session_id}/{member_id}/clear-override")
+async def clear_member_override(session_id: str, member_id: str):
+    """Undo a "Move to Eligible" override; the eligibility filter decides again."""
+    return await asyncio.to_thread(_override_member_sync, session_id, member_id, '', False)
+
+def _override_member_sync(session_id: str, member_id: str, reason: str, set_override: bool):
+    try:
+        session = get_session(session_id)
+        if not session:
+            return error_response(404, "Session not found or expired", context={"session_id": session_id})
+
+        reason = (reason or '').strip()
+        if set_override and not reason:
+            return error_response(400, "A reason is required to move a member to eligible", context={"session_id": session_id, "member_id": member_id})
+
+        located = _locate_member(session_id, session, member_id)
+        if not isinstance(located, tuple):
+            return located
+        category_name, index, member = located
+
+        if set_override:
+            flags = {'_override': 'eligible', '_override_reason': reason}
+        else:
+            flags = {'_override': None, '_override_reason': None}
+        member.update(flags)
+
+        uid = member.get('_uid')
+        if uid:
+            update_session(session_id, dataframe=pd.DataFrame(_update_source_roster(session, uid, updates=flags)))
+
+        source_category = 'eligible' if category_name == 'small_unit' else category_name
+        new_category = place_member(session_id, member, source_category, index if category_name != 'small_unit' else None)
+        _refresh_derived(session_id)
+
+        return JSONResponse(content={
+            "success": True,
+            "message": "Member moved to eligible" if set_override else "Override removed",
+            "member_id": member_id,
+            "new_category": new_category,
+        })
+    except Exception as e:
+        return error_response(500, "Failed to update member eligibility", context={"session_id": session_id, "member_id": member_id}, exception=e)
 
 
 @router.post("/roster/logo/{session_id}")
@@ -625,6 +653,16 @@ async def reprocess_roster(session_id: str, data: Optional[Dict] = Body(default=
         if not dataframe_list:
             return error_response(400, "No roster data found to reprocess", context={"session_id": session_id})
 
+        # Sessions created before members had stable ids: assign them now so the
+        # editor can keep the source roster in step from here on.
+        if any(not row.get('_uid') for row in dataframe_list):
+            dataframe_list = [
+                {**row, '_uid': row.get('_uid') or f"u{i}"} for i, row in enumerate(dataframe_list)
+            ]
+            update_session(session_id, dataframe=pd.DataFrame(dataframe_list))
+
+        # The source roster already carries every add / delete / edit / override made
+        # in the editor, so rebuilding from it keeps the reviewer's changes.
         dataframe = pd.DataFrame(dataframe_list)
         cycle = session.get('cycle', 'SSG')
         year = session.get('year', 2025)

@@ -60,12 +60,12 @@ def clean_dataframe(records):
 
     # Ensure only PDF-appropriate columns remain
     from constants import PDF_COLUMNS
-    expected_cols = PDF_COLUMNS + ['REASON', 'SSAN', 'PAFSC']
+    # Display columns only, always in PDF_COLUMNS order. Category records also carry
+    # eligibility fields (PAFSC, RE, UIF, ...) and editor bookkeeping (_uid, ...); those
+    # must never reach the PDF tables, which print every column they are given.
+    expected_cols = PDF_COLUMNS + ['REASON', 'SSAN']
 
-    df_cols = df.columns.tolist()
-    cols_to_keep = [col for col in df_cols if col in expected_cols or col in
-                    ['FULL_NAME', 'GRADE', 'DATE_ARRIVED_STATION', 'DAFSC',
-                     'ASSIGNED_PAS_CLEARTEXT', 'DOR', 'TAFMSD', 'ASSIGNED_PAS', 'REASON']]
+    cols_to_keep = [col for col in expected_cols if col in df.columns]
     if cols_to_keep:
         df = df[cols_to_keep]
 

@@ -30,6 +30,9 @@ def _process_upload(file, contents, cycle, year, session_id, mel_type):
 
     try:
         df = ingest_file(contents, file.filename, logger=logger)
+        # Stable per-member id used by the roster editor (edit / delete / override /
+        # re-process all locate the member by it).
+        df['_uid'] = [f"u{i}" for i in range(len(df))]
         processed_df, pdf_df = prepare_session_dataframes(df)
 
         create_session(processed_df, pdf_df, session_id=session_id)
