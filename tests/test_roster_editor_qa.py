@@ -281,3 +281,16 @@ class TestDateNormalisation:
         client.put(f"/api/v1/roster/member/{sid}/{ollie['member_id']}", json={"DOR": "2024-01-01"})
         moved = _find(_preview(client, sid), "eligible", "TESTOSCAR")
         assert moved["DOR"] == "01-JAN-2024"
+
+
+class TestCommanderTitle:
+    def test_commander_title_is_kept_for_the_pdf(self, client, sid):
+        from session_manager import get_session
+        info = {"srid": "1111111", "senior_rater_rank": "Col", "senior_rater_title": "Group Commander",
+                "senior_rater_name": "TESTSR, CASEY", "commander_rank": "Lt Col",
+                "commander_title": "Squadron Commander", "commander_first_name": "ALEX",
+                "commander_last_name": "TESTCC"}
+        r = client.post("/api/v1/initial-mel/submit/pascode-info", json={
+            "session_id": sid, "pascode_info": {"ZZ1TEST": info, "ZZ2TEST": info, "small_unit_sr": info}})
+        assert r.status_code == 200, r.text[:300]
+        assert get_session(sid)["pascode_map"]["ZZ1TEST"]["commander_title"] == "Squadron Commander"

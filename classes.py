@@ -25,6 +25,9 @@ class PasCodeInfo(BaseModel):
     senior_rater_middle_name: str | None = None
     senior_rater_last_name: str | None = None
     commander_rank: str | None = None
+    # The UI has always sent commander_title; without this field pydantic dropped it and
+    # the MEL printed the senior rater's title on the commander's signature line.
+    commander_title: str | None = None
     commander_first_name: str | None = None
     commander_middle_name: str | None = None
     commander_last_name: str | None = None
