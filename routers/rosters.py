@@ -11,6 +11,7 @@ import asyncio
 import logging
 import re
 import uuid
+from datetime import date
 from typing import Any, Dict, Literal, Optional
 
 import pandas as pd
@@ -18,14 +19,15 @@ from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-from config.columns import ROSTER_UPLOAD_REQUIRED_COLUMNS
+from config.columns import ROSTER_PII_DENYLIST_PATTERNS, ROSTER_UPLOAD_REQUIRED_COLUMNS
 from error_handling import error_response
 from file_ingestion import ingest_file, validate_file_type
 from rate_limiter import limiter
 from roster_exports import build_pdf, build_xlsx
 from roster_rules import (
-    RosterRunError, canonicalize_dataframe, get_rule, list_rules, parse_as_of, run_rule,
+    RosterRunError, canonicalize_dataframe, get_rule, list_rules, normalize_header, parse_as_of, run_rule,
 )
+from roster_runs.registry import list_runs
 from session_manager import create_session, get_session, update_session
 
 logger = logging.getLogger(__name__)
@@ -44,6 +46,15 @@ class RosterRunRequest(BaseModel):
 
 class RosterExportRequest(RosterRunRequest):
     format: Literal["pdf", "xlsx"]
+
+
+_PII_PATTERNS = [re.compile(p) for p in ROSTER_PII_DENYLIST_PATTERNS]
+
+
+def is_pii_column(name: str) -> bool:
+    """True for headers that must never be stored (DOB, HOME_*, phone, SSN-like, ...)."""
+    text = normalize_header(name)
+    return any(p.search(text) for p in _PII_PATTERNS)
 
 
 def _session_columns(session: dict) -> list[str]:
@@ -97,7 +108,12 @@ def _run(roster_id: str, payload: RosterRunRequest):
 @router.post("/rosters/upload")
 @limiter.limit("10/minute")
 async def upload_roster(request: Request, file: UploadFile = File(...)):
-    """Upload a CSV/XLSX roster. Only FULL_NAME and GRADE (or their aliases) are required."""
+    """Upload a CSV/XLSX roster. Only FULL_NAME and GRADE (or their aliases) are required.
+
+    Only recognised columns (config/columns.py ROSTER_COLUMN_ALIASES) are stored; everything else —
+    including DATE_OF_BIRTH, HOME_*, phone, SSN-like columns — is dropped before the session is
+    written. The response lists which retention/BTZ runs the stored columns support.
+    """
     try:
         validate_file_type(file.content_type)
         contents = await file.read()
@@ -111,6 +127,11 @@ async def upload_roster(request: Request, file: UploadFile = File(...)):
         if df.empty:
             return error_response(400, "Uploaded file contains no data", context={"step": "rosters_upload"})
         canonical_df, columns_found, unmapped, warnings = canonicalize_dataframe(df)
+        # Defence in depth: never store PII columns, even if an alias ever maps one.
+        pii = [c for c in columns_found if is_pii_column(c)]
+        if pii:
+            canonical_df = canonical_df.drop(columns=pii)
+            columns_found = [c for c in columns_found if c not in pii]
         missing = [c for c in ROSTER_UPLOAD_REQUIRED_COLUMNS if c not in columns_found]
         if missing:
             return error_response(
@@ -128,12 +149,17 @@ async def upload_roster(request: Request, file: UploadFile = File(...)):
             "Roster upload session=%s rows=%d columns=%d unmapped=%d",
             session_id[:8], len(canonical_df), len(columns_found), len(unmapped),
         )
+        runs = [
+            {"id": r["id"], "label": r["label"], "available": r["available"], "missing_columns": r["missing_columns"]}
+            for r in list_runs(date.today(), columns_found)
+        ]
         return JSONResponse(content={
             "session_id": session_id,
             "row_count": int(len(canonical_df)),
             "columns_found": columns_found,
             "unmapped_columns": unmapped,
             "warnings": warnings,
+            "runs": runs,
         })
     except Exception as e:
         return error_response(500, "Failed to process roster upload", context={"step": "rosters_upload"}, exception=e)

@@ -19,6 +19,7 @@ from routers.roster import router as roster_router
 from routers.documents import router as documents_router
 from routers.calculators import router as calculators_router
 from routers.rosters import router as rosters_router
+from routers.roster_runs import router as roster_runs_router
 
 
 @asynccontextmanager
@@ -101,6 +102,7 @@ app.include_router(roster_router, prefix="/api/v1")
 app.include_router(documents_router, prefix="/api/v1")
 app.include_router(calculators_router, prefix="/api/v1")
 app.include_router(rosters_router, prefix="/api/v1")
+app.include_router(roster_runs_router, prefix="/api/v1")
 
 # Backward-compat: /api/* redirects to /api/v1/*
 from fastapi.responses import RedirectResponse  # noqa: F811
